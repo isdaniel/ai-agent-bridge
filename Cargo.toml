@@ -21,7 +21,7 @@ members = [
 version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
-repository = "https://github.com/your-org/ai-agent-bridge"
+repository = "https://github.com/isdaniel/ai-agent-bridge"
 authors = ["danielshih"]
 
 [workspace.dependencies]

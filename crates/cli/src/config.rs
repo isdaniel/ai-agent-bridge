@@ -163,7 +163,10 @@ mod tests {
 
     #[test]
     fn env_var_maps_to_agent_append_system_prompt() {
-        std::env::set_var("AAB_AGENTS__CLAUDE__APPEND_SYSTEM_PROMPT", "test-prompt-123");
+        std::env::set_var(
+            "AAB_AGENTS__CLAUDE__APPEND_SYSTEM_PROMPT",
+            "test-prompt-123",
+        );
         let cfg = AppConfig::load(None).unwrap();
         let agent = cfg.agents.get("claude");
         assert!(agent.is_some());

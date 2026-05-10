@@ -242,13 +242,6 @@ user (LINE):  /reset
 bot:          session reset.
 ```
 
-## Security note on `--dangerously-skip-permissions`
-
-The default config makes `claude` skip every tool-permission prompt. This is intentional — the bridge has no way to ask a human, and `claude` would otherwise hang. **Run the bridge against a workspace you'd be willing to let an unattended agent operate on** (a dedicated repo, a sandbox VM, etc.). Two safer alternatives:
-
-1. **`skip_permissions = false`** in config → permission prompts get forwarded to chat as `/yes <id>` / `/no <id>`. Slower UX but fully gated.
-2. **Restrict via `cwd`** in `[agents.claude].cwd` so `claude` only sees a sandboxed directory.
-
 ## Adding a new agent or platform
 
 Implement the trait in `crates/core-traits/src/lib.rs`:
@@ -301,20 +294,6 @@ Steps:
 | `daemon`            | Single-instance fd-lock, rotating logs, systemd-user service install |
 | `cli`               | `aab` binary; clap subcommands; reads config; wires platforms ↔ engine ↔ agents |
 | `test-support`      | Shared `EchoAgent` / `MockPlatform` fixtures |
-
-## CI / Release
-
-GitHub Actions in `.github/workflows/`:
-- `ci.yml` — `fmt`, `clippy -D warnings`, `cargo test --workspace` on Linux
-- `release.yml` — tag-triggered cross-compiled binaries for `x86_64-unknown-linux-gnu` and `aarch64-unknown-linux-gnu`
-
-Run locally before pushing:
-
-```bash
-cargo fmt --all
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test  --workspace
-```
 
 See [`docs/architecture.md`](docs/architecture.md) for design details (actor model, persistence, streaming, permission round-trip).
 
