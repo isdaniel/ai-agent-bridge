@@ -1,0 +1,18 @@
+[package]
+name = "daemon"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+tracing-appender.workspace = true
+fd-lock.workspace = true
+thiserror.workspace = true
+dirs = "5.0.1"
+
+[dev-dependencies]
+tempfile.workspace = true

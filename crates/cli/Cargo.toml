@@ -1,0 +1,47 @@
+[package]
+name = "cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "aab"
+path = "src/main.rs"
+
+[features]
+# CLI-first defaults: claude-code (stream-json) + cli-agent (gh copilot, etc.)
+# are core. http-agent is opt-in for the API escape hatch.
+default = ["line", "slack", "claude-code", "stdio", "cli-agent", "media-local", "acp"]
+line = ["dep:platform-line"]
+slack = ["dep:platform-slack"]
+stdio = ["dep:platform-stdio"]
+claude-code = ["dep:agent-claude-code"]
+acp = ["dep:agent-acp"]
+cli-agent = ["dep:agent-cli"]
+http-agent = ["dep:agent-http"]
+media-local = ["dep:media-publisher"]
+
+[dependencies]
+core-traits.workspace = true
+core-engine.workspace = true
+core-commands.workspace = true
+daemon.workspace = true
+
+agent-claude-code = { workspace = true, optional = true }
+agent-acp = { workspace = true, optional = true }
+agent-cli = { workspace = true, optional = true }
+agent-http = { workspace = true, optional = true }
+platform-line = { workspace = true, optional = true }
+platform-slack = { workspace = true, optional = true }
+platform-stdio = { workspace = true, optional = true }
+media-publisher = { workspace = true, optional = true }
+
+anyhow.workspace = true
+clap.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+serde.workspace = true
+figment.workspace = true
+toml.workspace = true
+url.workspace = true

@@ -1,0 +1,12 @@
+[package]
+name = "platform-stdio"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+core-traits.workspace = true
+async-trait.workspace = true
+anyhow.workspace = true
+tokio.workspace = true
+tracing.workspace = true

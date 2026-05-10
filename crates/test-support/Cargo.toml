@@ -1,0 +1,13 @@
+[package]
+name = "test-support"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+core-traits.workspace = true
+async-trait.workspace = true
+anyhow.workspace = true
+tokio.workspace = true
+mockall.workspace = true
