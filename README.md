@@ -92,6 +92,58 @@ chmod +x start-bridge.sh
 ./start-bridge.sh --port 8443                       # bind webhook on a different port
 ```
 
+### Auto-start on boot (systemd-user)
+
+To have `start-bridge.sh` launch automatically when the machine boots:
+
+```bash
+# 1) Build once (the service skips build on every start)
+cargo build --release -p cli
+
+# 2) Enable lingering so user services start at boot, not at login
+loginctl enable-linger "$USER"
+
+# 3) Create the systemd user unit
+mkdir -p ~/.config/systemd/user
+cat > ~/.config/systemd/user/ai-agent-bridge.service << 'EOF'
+[Unit]
+Description=AI Agent Bridge (start-bridge.sh)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/<USER>/ai-agent-bridge
+ExecStart=/home/<USER>/ai-agent-bridge/start-bridge.sh --skip-build
+Restart=on-failure
+RestartSec=10
+# Adjust PATH to include all required binaries (claude, ngrok, cargo, etc.)
+Environment=PATH=/home/<USER>/.local/bin:/home/<USER>/.nvm/versions/node/v22.22.0/bin:/home/<USER>/.cargo/bin:/usr/local/bin:/usr/bin:/bin:/snap/bin
+
+[Install]
+WantedBy=default.target
+EOF
+
+# 4) Replace <USER> with your actual username
+sed -i "s|<USER>|$USER|g" ~/.config/systemd/user/ai-agent-bridge.service
+
+# 5) Enable and start
+systemctl --user daemon-reload
+systemctl --user enable ai-agent-bridge.service
+systemctl --user start ai-agent-bridge.service
+```
+
+Useful commands:
+
+```bash
+systemctl --user status ai-agent-bridge     # check status
+systemctl --user restart ai-agent-bridge    # restart
+systemctl --user stop ai-agent-bridge       # stop
+journalctl --user -u ai-agent-bridge -f     # tail logs
+```
+
+> **Note**: the service uses `--skip-build` to avoid running `cargo build` on every restart. After updating the code, rebuild manually  (`cargo build --release -p cli`) and then `systemctl --user restart ai-agent-bridge`.
+
 If you'd rather wire it up by hand:
 
 ```bash

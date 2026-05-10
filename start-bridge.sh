@@ -19,12 +19,13 @@
 #     AAB_LOG=info,platform_line=debug
 #
 # Behaviour:
-#   - Spawns cloudflared in the background (for --platform line) and prints
-#     the public webhook URL — you must paste it into the LINE Developers
-#     Console webhook field once per tunnel restart (quick tunnels rotate).
-#   - On Ctrl+C, kills cloudflared, then aab.
+#   - Spawns tunnel(s) in the background (for --platform line):
+#     * If NGROK_DOMAIN is set: uses ngrok for the webhook (fixed URL).
+#     * Otherwise: falls back to cloudflared quick tunnels (random URL).
+#     Media tunnel always uses cloudflared (random URL, auto-configured).
+#   - On Ctrl+C, kills tunnel processes, then aab.
 #
-# Requires: cargo, cloudflared (only when --platform line and tunnel enabled).
+# Requires: cargo, ngrok or cloudflared (only when --platform line and tunnel enabled).
 
 set -euo pipefail
 
@@ -114,9 +115,47 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-# ── Tunnel helper ─────────────────────────────────────────────────────────
-# start_tunnel <port> → sets REPLY to the public URL, appends PID to PIDS.
-start_tunnel() {
+# ── Tunnel helpers ────────────────────────────────────────────────────────
+
+# start_ngrok_tunnel <port> <domain> → sets REPLY to the public URL, appends PID to PIDS.
+start_ngrok_tunnel() {
+  local port="$1" domain="$2"
+  local log
+  log="$(mktemp)"
+  echo "→ starting ngrok tunnel → http://localhost:$port (domain: $domain)"
+  if ! command -v ngrok >/dev/null 2>&1; then
+    echo "✗ ngrok not found. Install with:"
+    echo "    https://ngrok.com/download"
+    echo "  Then run: ngrok config add-authtoken <YOUR_TOKEN>"
+    exit 1
+  fi
+  ngrok http "$port" --domain "$domain" --log stdout --log-format logfmt \
+    >"$log" 2>&1 &
+  local pid=$!
+  PIDS+=("$pid")
+
+  # Wait up to 30 s for ngrok to be ready.
+  REPLY=""
+  for _ in {1..60}; do
+    if grep -q 'started tunnel' "$log" 2>/dev/null || \
+       grep -q 'url=https://' "$log" 2>/dev/null; then
+      REPLY="https://$domain"
+      return 0
+    fi
+    if ! kill -0 "$pid" 2>/dev/null; then
+      echo "✗ ngrok exited unexpectedly. Log:"
+      sed 's/^/  /' "$log" | tail -n 30
+      exit 1
+    fi
+    sleep 0.5
+  done
+  echo "✗ ngrok failed to start within 30 s. Log:"
+  sed 's/^/  /' "$log" | tail -n 30
+  exit 1
+}
+
+# start_cloudflared_tunnel <port> → sets REPLY to the public URL, appends PID to PIDS.
+start_cloudflared_tunnel() {
   local port="$1"
   local log
   log="$(mktemp)"
@@ -160,10 +199,20 @@ start_tunnel() {
 if [[ "$PLATFORM" == "line" && "$USE_TUNNEL" -eq 1 ]]; then
   MEDIA_PORT="${AAB_MEDIA_PORT:-8081}"
 
-  start_tunnel "$WEBHOOK_PORT"
-  TUNNEL_URL="$REPLY"
+  # Webhook tunnel: use ngrok (fixed domain) if NGROK_DOMAIN is set,
+  # otherwise fall back to cloudflared (random URL).
+  if [[ -n "${NGROK_DOMAIN:-}" ]]; then
+    start_ngrok_tunnel "$WEBHOOK_PORT" "$NGROK_DOMAIN"
+    TUNNEL_URL="$REPLY"
+    WEBHOOK_FIXED=1
+  else
+    start_cloudflared_tunnel "$WEBHOOK_PORT"
+    TUNNEL_URL="$REPLY"
+    WEBHOOK_FIXED=0
+  fi
 
-  start_tunnel "$MEDIA_PORT"
+  # Media tunnel: always cloudflared (random URL is fine — set via env var).
+  start_cloudflared_tunnel "$MEDIA_PORT"
   MEDIA_TUNNEL_URL="$REPLY"
 
   export AAB_PLATFORMS__LINE__MEDIA__KIND="local-http"
@@ -172,7 +221,11 @@ if [[ "$PLATFORM" == "line" && "$USE_TUNNEL" -eq 1 ]]; then
 
   echo
   echo "════════════════════════════════════════════════════════════════════"
-  echo "  LINE webhook URL (paste into Developers Console → Messaging API):"
+  if [[ "$WEBHOOK_FIXED" -eq 1 ]]; then
+    echo "  LINE webhook URL (fixed — no need to update LINE Console):"
+  else
+    echo "  LINE webhook URL (paste into Developers Console → Messaging API):"
+  fi
   echo "    $TUNNEL_URL/webhook"
   echo
   echo "  Media download URL (files served here):"
