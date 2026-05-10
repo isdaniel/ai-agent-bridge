@@ -11,7 +11,7 @@ path = "src/main.rs"
 [features]
 # CLI-first defaults: claude-code (stream-json) + cli-agent (gh copilot, etc.)
 # are core. http-agent is opt-in for the API escape hatch.
-default = ["line", "slack", "claude-code", "stdio", "cli-agent", "media-local", "acp"]
+default = ["line", "slack", "claude-code", "stdio", "cli-agent", "media-local", "media-azure", "acp"]
 line = ["dep:platform-line"]
 slack = ["dep:platform-slack"]
 stdio = ["dep:platform-stdio"]
@@ -19,7 +19,8 @@ claude-code = ["dep:agent-claude-code"]
 acp = ["dep:agent-acp"]
 cli-agent = ["dep:agent-cli"]
 http-agent = ["dep:agent-http"]
-media-local = ["dep:media-publisher"]
+media-local = ["dep:media-publisher", "media-publisher/local-http"]
+media-azure = ["dep:media-publisher", "media-publisher/azure-blob"]
 
 [dependencies]
 core-traits.workspace = true

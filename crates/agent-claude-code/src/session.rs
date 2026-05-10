@@ -1,5 +1,6 @@
 //! Live `claude` subprocess wrapped as an [`AgentSession`].
 
+use std::path::Path;
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
@@ -302,12 +303,16 @@ async fn translate_event(
             }
             let mut out = Vec::new();
             for block in message.content {
-                if let ContentBlock::Text { text } = block {
+                if let ContentBlock::Text { ref text } = block {
                     if !text.is_empty() {
+                        let file_atts = extract_file_attachments(text);
                         out.push(Event::AssistantText {
-                            text,
+                            text: text.clone(),
                             partial: false,
                         });
+                        for att in file_atts {
+                            out.push(Event::AssistantAttachment(att));
+                        }
                     }
                 } else if let ContentBlock::ToolUse { id, name, .. } = block {
                     out.push(Event::ToolStart { name, id });
@@ -375,6 +380,133 @@ async fn translate_event(
     }
 }
 
+/// Scan text for absolute file paths pointing to existing, downloadable files.
+/// Returns `Attachment` events for each detected file.
+fn extract_file_attachments(text: &str) -> Vec<Attachment> {
+    let mut attachments = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+
+    for candidate in find_absolute_paths(text) {
+        let path = Path::new(candidate);
+        if !path.is_file() {
+            continue;
+        }
+        let ext = match path.extension().and_then(|e| e.to_str()) {
+            Some(e) => e.to_ascii_lowercase(),
+            None => continue,
+        };
+        let (kind, mime) = match mime_for_ext(&ext) {
+            Some(v) => v,
+            None => continue,
+        };
+        if !seen.insert(candidate.to_string()) {
+            continue;
+        }
+        let bytes = std::fs::metadata(path).ok().map(|m| m.len());
+        let name = path.file_name().and_then(|n| n.to_str()).map(String::from);
+        attachments.push(Attachment {
+            kind,
+            path: path.to_path_buf(),
+            mime: mime.to_string(),
+            bytes,
+            name,
+        });
+    }
+    attachments
+}
+
+/// Extract substrings that look like absolute file paths from text.
+fn find_absolute_paths(text: &str) -> Vec<&str> {
+    const PREFIXES: &[&str] = &[
+        "/tmp/", "/home/", "/var/", "/opt/", "/srv/", "/root/", "/data/", "/mnt/", "/usr/",
+    ];
+    let mut results = Vec::new();
+    let mut search_from = 0;
+    while search_from < text.len() {
+        let remaining = &text[search_from..];
+        let mut earliest: Option<usize> = None;
+        for prefix in PREFIXES {
+            if let Some(pos) = remaining.find(prefix) {
+                earliest = Some(match earliest {
+                    Some(e) => e.min(pos),
+                    None => pos,
+                });
+            }
+        }
+        let start = match earliest {
+            Some(pos) => pos,
+            None => break,
+        };
+        let abs_start = search_from + start;
+        let path_bytes = &text.as_bytes()[abs_start..];
+        let end = path_bytes
+            .iter()
+            .position(|&b| {
+                b == b' '
+                    || b == b'\n'
+                    || b == b'\r'
+                    || b == b'\t'
+                    || b == b'"'
+                    || b == b'\''
+                    || b == b')'
+                    || b == b']'
+                    || b == b'}'
+                    || b == b'>'
+                    || b == b'`'
+                    || b == b'\0'
+            })
+            .unwrap_or(path_bytes.len());
+        let candidate = &text[abs_start..abs_start + end];
+        // Strip trailing punctuation that's likely not part of the path.
+        let candidate = candidate.trim_end_matches(['.', ',', ';']);
+        if candidate.len() > 5 && candidate.contains('.') {
+            results.push(candidate);
+        }
+        search_from = abs_start + end;
+    }
+    results
+}
+
+fn mime_for_ext(ext: &str) -> Option<(AttachmentKind, &'static str)> {
+    match ext {
+        // Documents
+        "xlsx" => Some((
+            AttachmentKind::File,
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )),
+        "xls" => Some((AttachmentKind::File, "application/vnd.ms-excel")),
+        "csv" => Some((AttachmentKind::File, "text/csv")),
+        "pdf" => Some((AttachmentKind::File, "application/pdf")),
+        "docx" => Some((
+            AttachmentKind::File,
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        )),
+        "doc" => Some((AttachmentKind::File, "application/msword")),
+        "pptx" => Some((
+            AttachmentKind::File,
+            "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        )),
+        "txt" => Some((AttachmentKind::File, "text/plain")),
+        "json" => Some((AttachmentKind::File, "application/json")),
+        "xml" => Some((AttachmentKind::File, "application/xml")),
+        "html" | "htm" => Some((AttachmentKind::File, "text/html")),
+        // Archives
+        "zip" => Some((AttachmentKind::File, "application/zip")),
+        "tar" => Some((AttachmentKind::File, "application/x-tar")),
+        "gz" | "tgz" => Some((AttachmentKind::File, "application/gzip")),
+        // Images
+        "png" => Some((AttachmentKind::Image, "image/png")),
+        "jpg" | "jpeg" => Some((AttachmentKind::Image, "image/jpeg")),
+        "gif" => Some((AttachmentKind::Image, "image/gif")),
+        "svg" => Some((AttachmentKind::Image, "image/svg+xml")),
+        "webp" => Some((AttachmentKind::Image, "image/webp")),
+        // Data
+        "parquet" => Some((AttachmentKind::File, "application/octet-stream")),
+        "sqlite" | "db" => Some((AttachmentKind::File, "application/x-sqlite3")),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -410,6 +542,69 @@ mod tests {
         };
         let v = serialize_attachment(&att, 256 * 1024).unwrap();
         assert_eq!(v["source"]["type"], "file");
+    }
+
+    #[test]
+    fn find_paths_in_text() {
+        let text =
+            "整理好了，檔案在：\n\n/tmp/.tmpXSBOEw/slow_log_analysis.xlsx\n\n包含 5 個工作表";
+        let paths = find_absolute_paths(text);
+        assert_eq!(paths, vec!["/tmp/.tmpXSBOEw/slow_log_analysis.xlsx"]);
+    }
+
+    #[test]
+    fn find_multiple_paths() {
+        let text = "Report: /home/user/report.pdf and data: /tmp/data.csv done.";
+        let paths = find_absolute_paths(text);
+        assert_eq!(paths.len(), 2);
+        assert_eq!(paths[0], "/home/user/report.pdf");
+        assert_eq!(paths[1], "/tmp/data.csv");
+    }
+
+    #[test]
+    fn ignores_non_downloadable_paths() {
+        let text = "Edited /home/user/main.rs successfully";
+        let paths = find_absolute_paths(text);
+        assert_eq!(paths, vec!["/home/user/main.rs"]);
+        // But mime_for_ext won't match .rs, so extract_file_attachments returns empty
+        assert!(mime_for_ext("rs").is_none());
+    }
+
+    #[test]
+    fn strips_trailing_punctuation() {
+        let text = "File saved to /tmp/output.xlsx.";
+        let paths = find_absolute_paths(text);
+        assert_eq!(paths, vec!["/tmp/output.xlsx"]);
+    }
+
+    #[test]
+    fn extract_real_file() {
+        let dir = tempfile::tempdir().unwrap();
+        // tempdir is typically /tmp/... which matches our prefix list
+        let path = dir.path().join("report.xlsx");
+        std::fs::write(&path, b"PK\x03\x04").unwrap();
+        let text = format!("Done! File at {}", path.display());
+        let atts = extract_file_attachments(&text);
+        assert_eq!(atts.len(), 1);
+        assert_eq!(
+            atts[0].mime,
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        );
+        assert_eq!(atts[0].name.as_deref(), Some("report.xlsx"));
+    }
+
+    #[test]
+    fn skips_nonexistent_file() {
+        let text = "File at /tmp/does_not_exist_12345.xlsx";
+        let atts = extract_file_attachments(text);
+        assert!(atts.is_empty());
+    }
+
+    #[test]
+    fn no_false_positives_on_slash_commands() {
+        let text = "Try /reset or /help for more options.";
+        let paths = find_absolute_paths(text);
+        assert!(paths.is_empty());
     }
 }
 

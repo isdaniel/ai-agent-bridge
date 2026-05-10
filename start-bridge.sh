@@ -114,43 +114,80 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-# ── Tunnel (line only) ────────────────────────────────────────────────────
-if [[ "$PLATFORM" == "line" && "$USE_TUNNEL" -eq 1 ]]; then
-  if ! command -v cloudflared >/dev/null 2>&1; then
-    echo "✗ cloudflared not found. Install:"
+# ── Tunnel helper ─────────────────────────────────────────────────────────
+# start_tunnel <port> → sets REPLY to the public URL, appends PID to PIDS.
+start_tunnel() {
+  local port="$1"
+  local log
+  log="$(mktemp)"
+  echo "→ starting cloudflared tunnel → http://localhost:$port"
+  if command -v cloudflared >/dev/null 2>&1; then
+    cloudflared tunnel --url "http://localhost:$port" \
+      --no-autoupdate >"$log" 2>&1 &
+  elif command -v docker >/dev/null 2>&1; then
+    echo "  (using Docker: cloudflare/cloudflared)"
+    docker run --rm --network host \
+      cloudflare/cloudflared:latest tunnel --url "http://localhost:$port" \
+      --no-autoupdate >"$log" 2>&1 &
+  else
+    echo "✗ Neither cloudflared nor docker found. Install one of:"
     echo "    https://github.com/cloudflare/cloudflared#installing-cloudflared"
+    echo "    https://docs.docker.com/engine/install/"
     echo "  Or rerun with --no-tunnel if you already have public ingress."
     exit 1
   fi
-  TUNNEL_LOG="$(mktemp)"
-  echo "→ starting cloudflared tunnel → http://localhost:$WEBHOOK_PORT"
-  cloudflared tunnel --url "http://localhost:$WEBHOOK_PORT" \
-    --no-autoupdate >"$TUNNEL_LOG" 2>&1 &
-  TUNNEL_PID=$!
-  PIDS+=("$TUNNEL_PID")
+  local pid=$!
+  PIDS+=("$pid")
 
   # Wait up to 30 s for the public URL.
-  TUNNEL_URL=""
+  REPLY=""
   for _ in {1..60}; do
-    URL=$(grep -Eo 'https://[a-z0-9-]+\.trycloudflare\.com' "$TUNNEL_LOG" \
+    local url
+    url=$(grep -Eo 'https://[a-z0-9-]+\.trycloudflare\.com' "$log" \
             | head -n1 || true)
-    if [[ -n "$URL" ]]; then
-      TUNNEL_URL="$URL"
-      break
+    if [[ -n "$url" ]]; then
+      REPLY="$url"
+      return 0
     fi
     sleep 0.5
   done
-  if [[ -z "$TUNNEL_URL" ]]; then
-    echo "✗ failed to detect cloudflared URL within 30 s. Tunnel log:"
-    sed 's/^/  /' "$TUNNEL_LOG" | tail -n 30
-    exit 1
-  fi
+  echo "✗ failed to detect cloudflared URL within 30 s. Tunnel log:"
+  sed 's/^/  /' "$log" | tail -n 30
+  exit 1
+}
+
+# ── Tunnels (line only) ──────────────────────────────────────────────────
+if [[ "$PLATFORM" == "line" && "$USE_TUNNEL" -eq 1 ]]; then
+  MEDIA_PORT="${AAB_MEDIA_PORT:-8081}"
+
+  start_tunnel "$WEBHOOK_PORT"
+  TUNNEL_URL="$REPLY"
+
+  start_tunnel "$MEDIA_PORT"
+  MEDIA_TUNNEL_URL="$REPLY"
+
+  export AAB_PLATFORMS__LINE__MEDIA__KIND="local-http"
+  export AAB_PLATFORMS__LINE__MEDIA__BIND="0.0.0.0:${MEDIA_PORT}"
+  export AAB_PLATFORMS__LINE__MEDIA__PUBLIC_BASE_URL="$MEDIA_TUNNEL_URL"
+
   echo
   echo "════════════════════════════════════════════════════════════════════"
   echo "  LINE webhook URL (paste into Developers Console → Messaging API):"
   echo "    $TUNNEL_URL/webhook"
+  echo
+  echo "  Media download URL (files served here):"
+  echo "    $MEDIA_TUNNEL_URL"
   echo "════════════════════════════════════════════════════════════════════"
   echo
+fi
+
+# ── System prompt for Claude agent ────────────────────────────────────────
+if [[ "$AGENT" == "claude" && -z "${AAB_AGENTS__CLAUDE__APPEND_SYSTEM_PROMPT:-}" ]]; then
+  PROMPT_FILE="$REPO_ROOT/prompts/claude-system.md"
+  if [[ -f "$PROMPT_FILE" ]]; then
+    export AAB_AGENTS__CLAUDE__APPEND_SYSTEM_PROMPT
+    AAB_AGENTS__CLAUDE__APPEND_SYSTEM_PROMPT="$(cat "$PROMPT_FILE")"
+  fi
 fi
 
 # ── aab ───────────────────────────────────────────────────────────────────

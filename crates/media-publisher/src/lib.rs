@@ -18,6 +18,9 @@ use url::Url;
 #[cfg(feature = "local-http")]
 pub mod local_http;
 
+#[cfg(feature = "azure-blob")]
+pub mod azure_blob;
+
 #[async_trait]
 pub trait MediaPublisher: Send + Sync {
     /// Make `path` available at a public HTTPS URL. The URL should remain

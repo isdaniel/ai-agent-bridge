@@ -176,11 +176,7 @@ pub trait MessageHandler: Send + Sync {
 pub fn safe_filename(raw: &str) -> String {
     // Take only the basename — split on either separator and keep the last
     // non-empty piece.
-    let basename = raw
-        .rsplit(['/', '\\'])
-        .next()
-        .unwrap_or("")
-        .to_string();
+    let basename = raw.rsplit(['/', '\\']).next().unwrap_or("").to_string();
     let cleaned: String = basename
         .chars()
         .filter(|c| !c.is_control() && *c != '\0')

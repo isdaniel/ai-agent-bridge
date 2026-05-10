@@ -21,9 +21,7 @@ by other coding agents.
   cargo clippy --workspace --all-targets -- -D warnings
   cargo test --workspace
   ```
-- **Linux-only** target. Codebase compiles on macOS/Windows but daemon
-  helpers and `start-bridge.sh` assume systemd-user.
-- **`claude` is invoked with `--dangerously-skip-permissions` by default**
-  because the bridge runs unattended. Don't quietly remove this flag.
+- **Linux-only** target. Codebase compiles on macOS/Windows but daemon helpers and `start-bridge.sh` assume systemd-user.
+- **`claude` is invoked with `--dangerously-skip-permissions` by default** because the bridge runs unattended. Don't quietly remove this flag.
 
 See [`AGENT.md`](AGENT.md) for everything else.

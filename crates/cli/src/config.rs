@@ -89,13 +89,19 @@ pub struct LineSection {
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct MediaSection {
-    /// "local-http" — currently the only supported publisher.
+    /// "local-http" | "azure-blob"
     pub kind: Option<String>,
     /// Bind address for the in-process server, e.g. "0.0.0.0:8081".
     pub bind: Option<String>,
     /// Externally-reachable base URL the recipient will fetch from,
     /// e.g. "https://media.example.com" or "https://abcd.ngrok.io".
     pub public_base_url: Option<String>,
+    /// Env var holding the Azure Storage connection string (azure-blob only).
+    pub connection_string_env: Option<String>,
+    /// Azure Blob Storage container name (azure-blob only).
+    pub container: Option<String>,
+    /// SAS URL expiry in seconds (azure-blob only, default 3600).
+    pub sas_expiry_secs: Option<u64>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -153,5 +159,18 @@ mod tests {
     fn defaults_load_without_file() {
         let cfg = AppConfig::load(None).unwrap();
         assert!(!cfg.bridge.default_agent.is_empty());
+    }
+
+    #[test]
+    fn env_var_maps_to_agent_append_system_prompt() {
+        std::env::set_var("AAB_AGENTS__CLAUDE__APPEND_SYSTEM_PROMPT", "test-prompt-123");
+        let cfg = AppConfig::load(None).unwrap();
+        let agent = cfg.agents.get("claude");
+        assert!(agent.is_some());
+        assert_eq!(
+            agent.unwrap().append_system_prompt.as_deref(),
+            Some("test-prompt-123")
+        );
+        std::env::remove_var("AAB_AGENTS__CLAUDE__APPEND_SYSTEM_PROMPT");
     }
 }

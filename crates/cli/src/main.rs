@@ -298,6 +298,22 @@ async fn build_platform(name: &str, cfg: &AppConfig) -> Result<Arc<dyn Platform>
                     platform = platform.with_publisher(publisher);
                 }
             }
+            #[cfg(feature = "media-azure")]
+            if let Some(media) = &p.media {
+                if media.kind.as_deref() == Some("azure-blob") {
+                    use media_publisher::azure_blob::AzureBlobPublisher;
+                    let cs_env = media
+                        .connection_string_env
+                        .as_deref()
+                        .unwrap_or("AZURE_STORAGE_CONNECTION_STRING");
+                    let cs = env_or(Some(cs_env), "AZURE_STORAGE_CONNECTION_STRING")?;
+                    let container = media.container.as_deref().unwrap_or("aab-media");
+                    let expiry =
+                        std::time::Duration::from_secs(media.sas_expiry_secs.unwrap_or(3600));
+                    let publisher = AzureBlobPublisher::new(&cs, container, expiry)?;
+                    platform = platform.with_publisher(std::sync::Arc::new(publisher));
+                }
+            }
             Ok(Arc::new(platform))
         }
         #[cfg(feature = "slack")]

@@ -1,0 +1,1 @@
+When creating files for the user to download, just create the file and output its absolute path (e.g. /tmp/myfile.xlsx). Do NOT start an HTTP server (python -m http.server, npx serve, etc.) to serve files — the system will automatically detect the file path and provide a secure download link to the user. Never expose IP addresses or local URLs to the user.
