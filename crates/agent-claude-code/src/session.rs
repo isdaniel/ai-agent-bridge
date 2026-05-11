@@ -13,7 +13,7 @@ use core_traits::{
 };
 use dashmap::DashMap;
 use serde_json::json;
-use tokio::io::{AsyncWriteExt, BufWriter};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
 use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tracing::{debug, info, warn};
@@ -124,6 +124,18 @@ impl ClaudeCodeSession {
         let mut child = cmd.spawn().context("spawn claude")?;
         let stdin = child.stdin.take().ok_or_else(|| anyhow!("no stdin"))?;
         let stdout = child.stdout.take().ok_or_else(|| anyhow!("no stdout"))?;
+        let stderr = child.stderr.take();
+
+        // Log stderr lines so Claude errors are visible in bridge logs.
+        if let Some(stderr) = stderr {
+            let key_for_log = key.clone();
+            tokio::spawn(async move {
+                let mut lines = BufReader::new(stderr).lines();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    warn!(?key_for_log, stderr = %line, "claude stderr");
+                }
+            });
+        }
 
         let stdin = Arc::new(Mutex::new(BufWriter::new(stdin)));
         let session_id = Arc::new(std::sync::RwLock::new(chosen_id));
@@ -234,7 +246,8 @@ impl AgentSession for ClaudeCodeSession {
         }
         if let Some(mut child) = self.child.take() {
             match tokio::time::timeout(SHUTDOWN_GRACE, child.wait()).await {
-                Ok(Ok(_)) => info!("claude exited cleanly"),
+                Ok(Ok(status)) if status.success() => info!("claude exited cleanly"),
+                Ok(Ok(status)) => warn!(code = ?status.code(), "claude exited with error"),
                 _ => {
                     warn!("claude shutdown grace exceeded; killing");
                     let _ = child.start_kill();
@@ -347,7 +360,12 @@ async fn translate_event(
                 PartialEvent::Other => None,
             }
         }
-        StreamEvent::Result { session_id, .. } => {
+        StreamEvent::Result {
+            session_id,
+            is_error,
+            errors,
+            ..
+        } => {
             if let Some(id) = session_id.clone() {
                 if let Ok(mut g) = sid.write() {
                     *g = id;
@@ -355,7 +373,22 @@ async fn translate_event(
             }
             let id =
                 session_id.unwrap_or_else(|| sid.read().map(|g| g.clone()).unwrap_or_default());
-            Some(vec![Event::Done { session_id: id }])
+            let mut out = Vec::new();
+            if is_error == Some(true) {
+                let msg = errors
+                    .and_then(|e| {
+                        if e.is_empty() {
+                            None
+                        } else {
+                            Some(e.join("; "))
+                        }
+                    })
+                    .unwrap_or_else(|| "claude exited with an error".into());
+                warn!(error = %msg, "claude result error");
+                out.push(Event::Error(msg));
+            }
+            out.push(Event::Done { session_id: id });
+            Some(out)
         }
         StreamEvent::ControlRequest {
             request_id,

@@ -11,7 +11,7 @@ use anyhow::{anyhow, Context};
 use async_trait::async_trait;
 use core_commands::{parse_command_line, CommandRegistry, CommandSpec, Source};
 use core_traits::{Agent, Message, MessageHandler, Platform, ReplyCtx, Result, SessionKey};
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{mpsc, Mutex, RwLock};
 use tracing::{error, info, warn};
 
 pub use registry::{RegistryEntry, SessionRegistry};
@@ -113,15 +113,31 @@ impl Engine {
         attachments: Vec<core_traits::Attachment>,
     ) -> Result<()> {
         let handle = self.get_or_spawn_session(key, reply_ctx).await?;
-        handle
-            .tx
-            .send(Cmd::Send {
-                prompt,
-                attachments,
-            })
-            .await
-            .map_err(|_| anyhow!("session actor dropped"))?;
-        Ok(())
+        let cmd = Cmd::Send {
+            prompt,
+            attachments,
+        };
+        match handle.tx.send(cmd).await {
+            Ok(()) => Ok(()),
+            Err(mpsc::error::SendError(cmd)) => {
+                // Session actor died (e.g. Claude exited on bad --resume).
+                // Remove the dead handle and retry once with a fresh session.
+                warn!(?key, "session actor dropped; retrying with fresh session");
+                self.sessions.remove(key);
+                {
+                    let mut reg = self.registry.lock().await;
+                    reg.clear_active(key);
+                    reg.persist().await.ok();
+                }
+                let handle = self.get_or_spawn_session(key, reply_ctx).await?;
+                handle
+                    .tx
+                    .send(cmd)
+                    .await
+                    .map_err(|_| anyhow!("session actor dropped on retry"))?;
+                Ok(())
+            }
+        }
     }
 
     async fn handle_builtin(
@@ -153,6 +169,13 @@ impl Engine {
             "reset" | "new" => {
                 self.reset_session(key).await?;
                 self.platform.reply(reply_ctx, "session reset.").await.ok();
+            }
+            "clear" => {
+                self.clear_session(key).await?;
+                self.platform
+                    .reply(reply_ctx, "session cleared — all history wiped.")
+                    .await
+                    .ok();
             }
             "agent" => {
                 let target = args
@@ -372,6 +395,19 @@ impl Engine {
         Ok(())
     }
 
+    /// Hard clear: close the session actor AND wipe all registry history for
+    /// this key. The next inbound message starts a brand-new session with no
+    /// `--resume`, as if this user had never talked to the bridge.
+    pub async fn clear_session(&self, key: &SessionKey) -> Result<()> {
+        if let Some((_, h)) = self.sessions.remove(key) {
+            let _ = h.tx.send(Cmd::Close).await;
+        }
+        let mut reg = self.registry.lock().await;
+        reg.clear_all(key);
+        reg.persist().await.ok();
+        Ok(())
+    }
+
     /// Forward a `(name, value)` override to whichever agent is currently
     /// active for `key`. Unknown keys / unsupported agents return `Ok(())`
     /// per the trait default.
@@ -522,6 +558,10 @@ fn builtin_commands() -> Vec<CommandSpec> {
             "end current session and start a fresh one on next message",
         ),
         b("new", "alias for /reset"),
+        b(
+            "clear",
+            "wipe all session history and start completely fresh",
+        ),
         b("agent", "switch backing agent: /agent <name>"),
         b("agents", "list registered agents"),
         b("yes", "approve a pending permission: /yes <id>"),

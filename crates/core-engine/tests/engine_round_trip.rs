@@ -173,6 +173,30 @@ async fn unknown_slash_replies_help_hint() {
 }
 
 #[tokio::test]
+async fn clear_wipes_all_history() {
+    let platform = Arc::new(MockPlatform::new("mock"));
+    let engine = Engine::builder()
+        .add_agent(Arc::new(EchoAgent))
+        .default_agent("echo")
+        .platform(platform.clone())
+        .build()
+        .unwrap();
+    let key = SessionKey::new("mock", "uc");
+    let h: Arc<dyn MessageHandler> = engine.clone();
+
+    // Send a message to establish a session, then clear it.
+    h.handle(make_msg(key.clone(), "setup")).await;
+    drain_until(&platform, |r| r.iter().any(|x| x.text == "echo: setup")).await;
+
+    h.handle(make_msg(key.clone(), "/clear")).await;
+    drain_until(&platform, |r| r.iter().any(|x| x.text.contains("cleared"))).await;
+    let replies = platform.replies().await;
+    assert!(replies.iter().any(|r| r.text.contains("history wiped")));
+
+    engine.shutdown().await;
+}
+
+#[tokio::test]
 async fn max_sessions_rejects_overflow() {
     let platform = Arc::new(MockPlatform::new("mock"));
     let engine = Engine::builder()

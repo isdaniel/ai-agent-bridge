@@ -98,6 +98,13 @@ impl SessionRegistry {
         }
     }
 
+    /// Remove the entire entry for `key` — active session, all history, and
+    /// agent binding. The next inbound message will start completely fresh
+    /// with the default agent and a brand-new session id.
+    pub fn clear_all(&mut self, key: &SessionKey) {
+        self.entries.remove(key);
+    }
+
     pub fn entries(&self) -> &HashMap<SessionKey, RegistryEntry> {
         &self.entries
     }
@@ -190,5 +197,18 @@ mod tests {
         let e = reg.entries.get(&k).unwrap();
         assert!(e.active_session_id.is_none());
         assert_eq!(e.past_agent_session_ids.len(), 1);
+    }
+
+    #[test]
+    fn clear_all_removes_entry() {
+        let mut reg = SessionRegistry::in_memory();
+        let k = SessionKey::new("line", "U3");
+        reg.record_session(k.clone(), "claude".into(), "s1".into());
+        reg.record_session(k.clone(), "copilot".into(), "s2".into());
+        assert!(reg.entries.contains_key(&k));
+        reg.clear_all(&k);
+        assert!(!reg.entries.contains_key(&k));
+        assert!(reg.agent_for(&k).is_none());
+        assert!(reg.last_session_id(&k).is_none());
     }
 }

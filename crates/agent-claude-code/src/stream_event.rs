@@ -34,6 +34,10 @@ pub enum StreamEvent {
         subtype: Option<String>,
         #[serde(default)]
         session_id: Option<String>,
+        #[serde(default)]
+        is_error: Option<bool>,
+        #[serde(default)]
+        errors: Option<Vec<String>>,
         #[serde(flatten)]
         rest: serde_json::Value,
     },

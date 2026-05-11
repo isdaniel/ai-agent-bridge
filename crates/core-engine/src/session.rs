@@ -220,6 +220,10 @@ async fn handle_event(
         Event::Error(msg) => {
             state.flush(platform, reply_ctx).await;
             let _ = platform.reply(reply_ctx, &format!("⚠️ {msg}")).await;
+            // Clear active session so the next spawn doesn't --resume a broken ID.
+            let mut reg = registry.lock().await;
+            reg.clear_active(key);
+            let _ = reg.persist().await;
         }
         Event::Done { session_id } => {
             state.flush(platform, reply_ctx).await;
