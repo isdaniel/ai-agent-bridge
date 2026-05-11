@@ -17,7 +17,7 @@ use serde::Deserialize;
 use tracing::{debug, warn};
 
 use crate::sign::verify_signature;
-use crate::LineConfig;
+use crate::{now_ms, LineConfig};
 
 #[derive(Clone)]
 struct AppState {
@@ -74,6 +74,7 @@ async fn handle_webhook(
         let Some(em) = event.message else { continue };
         let state_cloned = state.clone();
         let uid_cloned = uid.clone();
+        let reply_token = event.reply_token.clone();
         tokio::spawn(async move {
             let (text, attachments) = build_payload(&state_cloned, &em).await;
             // Empty text + no attachments = nothing to dispatch (e.g. sticker we
@@ -87,6 +88,10 @@ async fn handle_webhook(
                 attachments,
                 reply_ctx: ReplyCtx {
                     user: Some(uid_cloned),
+                    extra: serde_json::json!({
+                        "reply_token": reply_token,
+                        "reply_token_ms": now_ms()
+                    }),
                     ..Default::default()
                 },
                 timestamp_ms: event.timestamp,
@@ -213,6 +218,8 @@ struct EventEnvelope {
     timestamp: i64,
     source: EventSource,
     message: Option<EventMessage>,
+    #[serde(rename = "replyToken", default)]
+    reply_token: Option<String>,
 }
 
 #[derive(Deserialize, Clone)]

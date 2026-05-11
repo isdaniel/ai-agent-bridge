@@ -152,8 +152,10 @@ impl ClaudeCodeSession {
         let perms = pending_perms.clone();
         let stdin_for_perm = stdin.clone();
         let translator = tokio::spawn(async move {
+            let mut ctx = TranslateCtx::default();
             while let Some(evt) = raw_rx.recv().await {
-                if let Some(translated) = translate_event(evt, &sid, &perms, &stdin_for_perm).await
+                if let Some(translated) =
+                    translate_event(evt, &sid, &perms, &stdin_for_perm, &mut ctx).await
                 {
                     for e in translated {
                         if events_tx.send(e).await.is_err() {
@@ -269,11 +271,84 @@ fn serialize_attachment(att: &Attachment, _inline_max: u64) -> Result<serde_json
     }
 }
 
+/// State carried across events within a single agent turn to track file
+/// creation via tool calls (Write, Bash) so we can deliver files even when
+/// the model doesn't mention the full path in its final text.
+#[derive(Default)]
+struct TranslateCtx {
+    /// Paths created via Write tool calls in the current turn.
+    tool_created_paths: std::collections::HashSet<std::path::PathBuf>,
+    /// Paths already emitted as AssistantAttachment (from text extraction).
+    emitted_paths: std::collections::HashSet<std::path::PathBuf>,
+}
+
+impl TranslateCtx {
+    fn reset_turn(&mut self) {
+        self.tool_created_paths.clear();
+        self.emitted_paths.clear();
+    }
+
+    /// Extract file_path from Write tool input JSON.
+    fn track_tool_use(&mut self, name: &str, input: &serde_json::Value) {
+        if name == "Write" || name == "write" {
+            if let Some(fp) = input.get("file_path").and_then(|v| v.as_str()) {
+                self.tool_created_paths.insert(std::path::PathBuf::from(fp));
+            }
+        }
+        // Bash/shell tool: look for file write patterns in the command
+        if name == "Bash" || name == "bash" {
+            if let Some(cmd) = input.get("command").and_then(|v| v.as_str()) {
+                for path in find_absolute_paths(cmd) {
+                    let p = Path::new(path);
+                    if let Some(ext) = p.extension().and_then(|e| e.to_str()) {
+                        if mime_for_ext(&ext.to_ascii_lowercase()).is_some() {
+                            self.tool_created_paths.insert(p.to_path_buf());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// At turn end, emit attachments for files created by tools but not yet
+    /// delivered via text extraction.
+    fn pending_attachments(&self) -> Vec<Attachment> {
+        let mut out = Vec::new();
+        for path in &self.tool_created_paths {
+            if self.emitted_paths.contains(path) {
+                continue;
+            }
+            if !path.is_file() {
+                continue;
+            }
+            let ext = match path.extension().and_then(|e| e.to_str()) {
+                Some(e) => e.to_ascii_lowercase(),
+                None => continue,
+            };
+            let (kind, mime) = match mime_for_ext(&ext) {
+                Some(v) => v,
+                None => continue,
+            };
+            let bytes = std::fs::metadata(path).ok().map(|m| m.len());
+            let name = path.file_name().and_then(|n| n.to_str()).map(String::from);
+            out.push(Attachment {
+                kind,
+                path: path.clone(),
+                mime: mime.to_string(),
+                bytes,
+                name,
+            });
+        }
+        out
+    }
+}
+
 async fn translate_event(
     evt: StreamEvent,
     sid: &Arc<std::sync::RwLock<String>>,
     pending: &Arc<DashMap<String, oneshot::Sender<bool>>>,
     _stdin: &Arc<Mutex<BufWriter<ChildStdin>>>,
+    ctx: &mut TranslateCtx,
 ) -> Option<Vec<Event>> {
     match evt {
         StreamEvent::System { session_id, .. } => {
@@ -282,6 +357,7 @@ async fn translate_event(
                     *g = id;
                 }
             }
+            ctx.reset_turn();
             None
         }
         StreamEvent::Assistant {
@@ -303,10 +379,15 @@ async fn translate_event(
                             partial: false,
                         });
                         for att in file_atts {
+                            ctx.emitted_paths.insert(att.path.clone());
                             out.push(Event::AssistantAttachment(att));
                         }
                     }
-                } else if let ContentBlock::ToolUse { id, name, .. } = block {
+                } else if let ContentBlock::ToolUse {
+                    id, name, input, ..
+                } = block
+                {
+                    ctx.track_tool_use(&name, &input);
                     out.push(Event::ToolStart { name, id });
                 }
             }
@@ -353,6 +434,13 @@ async fn translate_event(
             let id =
                 session_id.unwrap_or_else(|| sid.read().map(|g| g.clone()).unwrap_or_default());
             let mut out = Vec::new();
+            // Emit attachments for files created via tool calls but not
+            // detected in assistant text.
+            for att in ctx.pending_attachments() {
+                debug!(path = %att.path.display(), "emitting tool-tracked attachment");
+                out.push(Event::AssistantAttachment(att));
+            }
+            ctx.reset_turn();
             if is_error == Some(true) {
                 let msg = errors
                     .and_then(|e| {
@@ -642,6 +730,7 @@ mod tests {
                 .take()
                 .unwrap(),
         )));
+        let mut ctx = TranslateCtx::default();
         let evts = translate_event(
             StreamEvent::System {
                 subtype: Some("init".into()),
@@ -651,6 +740,7 @@ mod tests {
             &sid,
             &pending,
             &stdin,
+            &mut ctx,
         )
         .await;
         assert!(evts.is_none());
@@ -670,6 +760,7 @@ mod tests {
                 .take()
                 .unwrap(),
         )));
+        let mut ctx = TranslateCtx::default();
         let evts = translate_event(
             StreamEvent::Result {
                 subtype: None,
@@ -681,6 +772,7 @@ mod tests {
             &sid,
             &pending,
             &stdin,
+            &mut ctx,
         )
         .await;
         let events = evts.unwrap();
@@ -702,6 +794,7 @@ mod tests {
                 .take()
                 .unwrap(),
         )));
+        let mut ctx = TranslateCtx::default();
         let evts = translate_event(
             StreamEvent::Result {
                 subtype: None,
@@ -713,6 +806,7 @@ mod tests {
             &sid,
             &pending,
             &stdin,
+            &mut ctx,
         )
         .await;
         let events = evts.unwrap();
@@ -740,6 +834,89 @@ mod tests {
         assert!(mime_for_ext("zip").is_some());
         assert!(mime_for_ext("rs").is_none());
         assert!(mime_for_ext("py").is_none());
+    }
+
+    #[test]
+    fn translate_ctx_tracks_write_tool_paths() {
+        let mut ctx = TranslateCtx::default();
+        let input = serde_json::json!({"file_path": "/tmp/report.pdf", "content": "..."});
+        ctx.track_tool_use("Write", &input);
+        assert!(ctx
+            .tool_created_paths
+            .contains(Path::new("/tmp/report.pdf")));
+    }
+
+    #[test]
+    fn translate_ctx_pending_attachments_checks_existence() {
+        let dir = tempfile::tempdir().unwrap();
+        let existing = dir.path().join("exists.pdf");
+        std::fs::write(&existing, b"fake-pdf").unwrap();
+
+        let mut ctx = TranslateCtx::default();
+        ctx.tool_created_paths.insert(existing.clone());
+        ctx.tool_created_paths
+            .insert(std::path::PathBuf::from("/tmp/nonexistent_xyz.pdf"));
+
+        let atts = ctx.pending_attachments();
+        assert_eq!(atts.len(), 1);
+        assert_eq!(atts[0].path, existing);
+        assert_eq!(atts[0].mime, "application/pdf");
+    }
+
+    #[test]
+    fn translate_ctx_skips_already_emitted() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("doc.pdf");
+        std::fs::write(&path, b"fake-pdf").unwrap();
+
+        let mut ctx = TranslateCtx::default();
+        ctx.tool_created_paths.insert(path.clone());
+        ctx.emitted_paths.insert(path);
+
+        let atts = ctx.pending_attachments();
+        assert!(atts.is_empty());
+    }
+
+    #[tokio::test]
+    async fn translate_result_emits_tool_tracked_attachments() {
+        let sid = make_sid();
+        let pending = make_pending();
+        let stdin = Arc::new(Mutex::new(BufWriter::new(
+            tokio::process::Command::new("true")
+                .stdin(std::process::Stdio::piped())
+                .spawn()
+                .unwrap()
+                .stdin
+                .take()
+                .unwrap(),
+        )));
+
+        let dir = tempfile::tempdir().unwrap();
+        let pdf_path = dir.path().join("output.pdf");
+        std::fs::write(&pdf_path, b"fake-pdf").unwrap();
+
+        let mut ctx = TranslateCtx::default();
+        ctx.tool_created_paths.insert(pdf_path.clone());
+
+        let evts = translate_event(
+            StreamEvent::Result {
+                subtype: None,
+                session_id: Some("s3".into()),
+                is_error: None,
+                errors: None,
+                rest: serde_json::Value::Null,
+            },
+            &sid,
+            &pending,
+            &stdin,
+            &mut ctx,
+        )
+        .await;
+        let events = evts.unwrap();
+        // Should have: AssistantAttachment + Done
+        assert_eq!(events.len(), 2);
+        assert!(matches!(&events[0], Event::AssistantAttachment(att) if att.path == pdf_path));
+        assert!(matches!(&events[1], Event::Done { .. }));
     }
 }
 

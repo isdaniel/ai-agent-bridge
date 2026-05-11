@@ -411,16 +411,23 @@ inbound:
     └─ for each event in payload:
          - drop if timestamp < boot_ms (post-restart filter)
          - drop if allowlist non-empty and userId ∉ allowlist
+         - capture replyToken + timestamp into ReplyCtx.extra
          - if message.type ∈ { image, file, audio, video } and contentProvider == "line":
              GET https://api-data.line.me/v2/bot/message/{id}/content
                  Authorization: Bearer {channel_token}
              write to tempfile → Attachment
          - dispatch Message to handler
 
-outbound text:
-  POST https://api.line.me/v2/bot/message/push
-    body: { to: user, messages: [{type:"text", text}] }
-  Always Push API — reply tokens expire ~1 min, too short for AI latency.
+outbound text (reply-first strategy):
+  1. Check ReplyCtx.extra for a valid reply token (received < 25 s ago):
+     POST https://api.line.me/v2/bot/message/reply
+       body: { replyToken: token, messages: [{type:"text", text}] }
+     FREE — does not count toward monthly push message quota.
+     Token is single-use; subsequent messages in the same turn skip to step 2.
+  2. Fallback (token expired or already consumed):
+     POST https://api.line.me/v2/bot/message/push
+       body: { to: user, messages: [{type:"text", text}] }
+     Counts toward monthly quota.
 
 outbound typing indicator:
   POST https://api.line.me/v2/bot/chat/loading

@@ -2,7 +2,9 @@
 //!
 //! - Inbound: HTTPS webhook (signature-verified HMAC-SHA256), parses message
 //!   events, downloads media to a temp file, dispatches to MessageHandler.
-//! - Outbound: Push API (reply tokens are too short-lived for AI latency).
+//! - Outbound: Reply API first (free, no quota), Push API fallback (counted).
+//!   Reply tokens from the webhook are valid ~30 s; if the agent responds
+//!   within 25 s the reply is free. Otherwise falls back to Push API.
 //!   Attachments require a public HTTPS URL — provided by an injected
 //!   [`MediaPublisher`].
 //! - Optional allowlist of LINE user IDs (drops everything else silently).
@@ -21,6 +23,10 @@ use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
 pub use sign::verify_signature;
+
+const REPLY_TOKEN_TTL_MS: i64 = 25_000;
+const LINE_TEXT_MAX: usize = 5000;
+const LINE_MESSAGES_PER_CALL: usize = 5;
 
 #[derive(Clone, Debug)]
 pub struct LineConfig {
@@ -53,6 +59,56 @@ impl LinePlatform {
         self.publisher = Some(publisher);
         self
     }
+
+    fn extract_reply_token(extra: &serde_json::Value) -> Option<String> {
+        let token = extra.get("reply_token")?.as_str()?;
+        if token.is_empty() {
+            return None;
+        }
+        let ts = extra.get("reply_token_ms")?.as_i64()?;
+        let elapsed = now_ms() - ts;
+        if elapsed > REPLY_TOKEN_TTL_MS {
+            return None;
+        }
+        Some(token.to_string())
+    }
+
+    async fn reply_via_token(&self, token: &str, messages: &[serde_json::Value]) -> Result<()> {
+        let body = serde_json::json!({
+            "replyToken": token,
+            "messages": messages
+        });
+        let resp = self
+            .http
+            .post("https://api.line.me/v2/bot/message/reply")
+            .bearer_auth(&self.cfg.channel_token)
+            .json(&body)
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            anyhow::bail!("LINE reply-token failed: {status} {text}");
+        }
+        Ok(())
+    }
+
+    async fn push_message(&self, to: &str, messages: &[serde_json::Value]) -> Result<()> {
+        let body = serde_json::json!({"to": to, "messages": messages});
+        let resp = self
+            .http
+            .post("https://api.line.me/v2/bot/message/push")
+            .bearer_auth(&self.cfg.channel_token)
+            .json(&body)
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            anyhow::bail!("LINE push failed: {status} {text}");
+        }
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -76,21 +132,25 @@ impl Platform for LinePlatform {
             .user
             .as_deref()
             .ok_or_else(|| anyhow::anyhow!("LINE reply requires user id in ReplyCtx"))?;
-        let body = serde_json::json!({
-            "to": to,
-            "messages": [{"type": "text", "text": text}]
-        });
-        let resp = self
-            .http
-            .post("https://api.line.me/v2/bot/message/push")
-            .bearer_auth(&self.cfg.channel_token)
-            .json(&body)
-            .send()
-            .await?;
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            anyhow::bail!("LINE push failed: {status} {body}");
+
+        let chunks = split_text(text, LINE_TEXT_MAX);
+
+        for batch in chunks.chunks(LINE_MESSAGES_PER_CALL) {
+            let messages: Vec<serde_json::Value> = batch
+                .iter()
+                .map(|t| serde_json::json!({"type": "text", "text": t}))
+                .collect();
+
+            if let Some(token) = Self::extract_reply_token(&ctx.extra) {
+                match self.reply_via_token(&token, &messages).await {
+                    Ok(()) => continue,
+                    Err(e) => {
+                        debug!(error=%e, "reply token failed, falling back to push");
+                    }
+                }
+            }
+
+            self.push_message(to, &messages).await?;
         }
         Ok(())
     }
@@ -126,30 +186,28 @@ impl Platform for LinePlatform {
             AttachmentKind::Audio => serde_json::json!({
                 "type": "audio",
                 "originalContentUrl": url_str,
-                "duration": 1000, // best-effort placeholder; LINE requires it
+                "duration": 1000,
             }),
             AttachmentKind::File => {
-                // LINE has no generic file message; expose as a text link.
+                let label = att.name.as_deref().unwrap_or("file");
                 serde_json::json!({
                     "type": "text",
-                    "text": format!("file: {url_str}"),
+                    "text": format!("📎 {label}\n{url_str}"),
                 })
             }
         };
-        let body = serde_json::json!({"to": to, "messages": [line_msg]});
-        let resp = self
-            .http
-            .post("https://api.line.me/v2/bot/message/push")
-            .bearer_auth(&self.cfg.channel_token)
-            .json(&body)
-            .send()
-            .await?;
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            anyhow::bail!("LINE push (attachment) failed: {status} {body}");
+        let messages = [line_msg];
+
+        if let Some(token) = Self::extract_reply_token(&ctx.extra) {
+            match self.reply_via_token(&token, &messages).await {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    debug!(error=%e, "reply token failed for attachment, falling back to push");
+                }
+            }
         }
-        Ok(())
+
+        self.push_message(to, &messages).await
     }
 
     async fn show_typing(&self, ctx: &ReplyCtx) -> Result<()> {
@@ -177,6 +235,134 @@ impl Platform for LinePlatform {
     }
 }
 
-fn now_ms() -> i64 {
+pub(crate) fn now_ms() -> i64 {
     core_traits::now_ms()
+}
+
+/// Split text into chunks that fit within LINE's character limit.
+/// Splits at natural breakpoints: `---`, markdown headers (`##`), or
+/// double newlines. Falls back to single-newline splits, then hard cuts.
+fn split_text(text: &str, max_len: usize) -> Vec<&str> {
+    if text.len() <= max_len {
+        return vec![text];
+    }
+
+    let mut chunks = Vec::new();
+    let mut remaining = text;
+
+    while !remaining.is_empty() {
+        if remaining.len() <= max_len {
+            chunks.push(remaining.trim());
+            break;
+        }
+
+        let boundary = floor_char_boundary(remaining, max_len);
+        let search_region = &remaining[..boundary];
+
+        // Try splitting at `\n---` (section divider)
+        let split_pos = search_region
+            .rfind("\n---")
+            // Try splitting at markdown header `\n## `
+            .or_else(|| search_region.rfind("\n## "))
+            .or_else(|| search_region.rfind("\n# "))
+            // Try double newline (paragraph break)
+            .or_else(|| search_region.rfind("\n\n"))
+            // Try single newline
+            .or_else(|| search_region.rfind('\n'));
+
+        let pos = match split_pos {
+            Some(p) if p > 0 => p,
+            _ => boundary,
+        };
+
+        let chunk = remaining[..pos].trim();
+        if !chunk.is_empty() {
+            chunks.push(chunk);
+        }
+        remaining = remaining[pos..].trim_start_matches(['-', '\n', '\r']);
+        remaining = remaining.trim_start();
+    }
+
+    chunks.into_iter().filter(|s| !s.is_empty()).collect()
+}
+
+/// Find the largest byte index <= `index` that is a valid char boundary.
+fn floor_char_boundary(s: &str, index: usize) -> usize {
+    if index >= s.len() {
+        return s.len();
+    }
+    let mut i = index;
+    while i > 0 && !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn short_text_no_split() {
+        let chunks = split_text("hello world", 5000);
+        assert_eq!(chunks, vec!["hello world"]);
+    }
+
+    #[test]
+    fn splits_at_section_divider() {
+        let text = format!("{}\n---\n{}", "A".repeat(100), "B".repeat(100));
+        let chunks = split_text(&text, 150);
+        assert_eq!(chunks.len(), 2);
+        assert!(chunks[0].starts_with('A'));
+        assert!(chunks[1].starts_with('B'));
+    }
+
+    #[test]
+    fn splits_at_double_newline() {
+        let text = format!("{}\n\n{}", "A".repeat(100), "B".repeat(100));
+        let chunks = split_text(&text, 150);
+        assert_eq!(chunks.len(), 2);
+    }
+
+    #[test]
+    fn splits_at_single_newline_fallback() {
+        let text = format!("{}\n{}", "A".repeat(100), "B".repeat(100));
+        let chunks = split_text(&text, 150);
+        assert_eq!(chunks.len(), 2);
+    }
+
+    #[test]
+    fn hard_cut_no_newline() {
+        let text = "A".repeat(300);
+        let chunks = split_text(&text, 100);
+        assert!(chunks.len() >= 3);
+        for chunk in &chunks {
+            assert!(chunk.len() <= 100);
+        }
+    }
+
+    #[test]
+    fn multibyte_chars_no_panic() {
+        // Each Chinese char is 3 bytes; 2000 chars = 6000 bytes.
+        // Splitting at 5000 bytes must not panic on a char boundary.
+        let text = "正".repeat(2000);
+        let chunks = split_text(&text, 5000);
+        assert!(chunks.len() >= 2);
+        for chunk in &chunks {
+            assert!(chunk.len() <= 5000);
+        }
+    }
+
+    #[test]
+    fn real_world_long_message() {
+        let sections: Vec<String> = (0..10)
+            .map(|i| format!("## Section {}\n{}", i, "content ".repeat(80)))
+            .collect();
+        let text = sections.join("\n\n");
+        let chunks = split_text(&text, 5000);
+        assert!(chunks.len() > 1);
+        for chunk in &chunks {
+            assert!(chunk.len() <= 5000, "chunk too long: {}", chunk.len());
+        }
+    }
 }

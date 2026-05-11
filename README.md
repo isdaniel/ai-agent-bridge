@@ -33,7 +33,7 @@ The bridge passes `--dangerously-skip-permissions` to `claude` by default becaus
 | **`--agent acp`** — drives any ACP-spec server (Zed, Gemini, etc.) over JSON-RPC stdio | `[agents.acp].binary = "..."` |
 | **`--agent shell`** — generic CLI runner for `aichat`, `mods`, custom scripts | `[agents.shell].binary = "..."` |
 | **`--agent http` / `openai`** — escape hatch for OpenAI-compatible APIs | Off by default; needs API key |
-| **`--platform line`** — LINE Webhook + Push API | Inbound text + image/file/audio download |
+| **`--platform line`** — LINE Webhook + Reply/Push API | Inbound text + image/file/audio download. Reply API first (free), Push API fallback when token expires. |
 | **`--platform slack`** — Slack Socket Mode | Mention-only in channels (`@bot`), always respond in DMs; thread-aware reply + `files.uploadV2` |
 | **`--platform stdio`** — local terminal | Dev / smoke test without bot setup |
 | Per-user / per-channel **session persistence** | Restart-safe via `--resume <id>` |
@@ -370,7 +370,7 @@ Steps:
 | `agent-acp`         | JSON-RPC over stdio + ACP `initialize` / `session/*` handshake |
 | `agent-cli`         | Per-prompt subprocess runner — used by `--agent copilot` (`gh copilot explain`) and `--agent shell` |
 | `agent-http`        | Escape hatch: OpenAI-compatible HTTP/SSE client (off by default) |
-| `platform-line`     | LINE Webhook (HMAC-verified) + Push API + content download |
+| `platform-line`     | LINE Webhook (HMAC-verified) + Reply API (free) / Push API (fallback) + content download |
 | `platform-slack`    | Slack Socket Mode (WebSocket) + `chat.postMessage` + `files.uploadV2` |
 | `platform-stdio`    | Local terminal frontend (dev / demo) |
 | `media-publisher`   | `MediaPublisher` trait + in-process `LocalHttpPublisher` for hosting outbound files |

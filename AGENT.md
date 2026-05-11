@@ -93,13 +93,16 @@ crates/
 │                        cannot drive a CLI.
 │
 ├── platform-line/       LINE Messaging API.
-│   ├── lib.rs           Push API outbound; optional MediaPublisher
+│   ├── lib.rs           Reply-first outbound: tries Reply API (free,
+│   │                    token valid ~25 s), falls back to Push API
+│   │                    (counted) on expiry. Optional MediaPublisher
 │   │                    injection for image/audio (LINE requires public
 │   │                    HTTPS URLs — bridge cannot upload binaries).
 │   ├── sign.rs          HMAC-SHA256 verification with subtle constant-
 │   │                    time comparison. Has unit tests.
 │   └── webhook.rs       axum router; allowlist gate; post-restart
-│                        timestamp filter; downloads image/file/audio/
+│                        timestamp filter; captures replyToken into
+│                        ReplyCtx.extra; downloads image/file/audio/
 │                        video via api-data.line.me to tempfile.
 │
 ├── platform-slack/      Slack Socket Mode (no public IP needed).
@@ -169,7 +172,7 @@ crates/
 | `state.json` | Has `schema_version: 1`. Mismatched version → rename to `.json.bak`, start fresh. | Forward upgrade safety. Bump the const + add migration if you change the shape. |
 | `agent-claude-code::session::spawn` | Mints `--session-id <uuid>` for fresh sessions, `--resume <id>` for resumes. | We must know the session id immediately (for the registry) without waiting for the first system event. |
 | `Attachment` for Claude inbound | Always base64-encoded inline in the NDJSON stream. | The `"type":"file"` source format is not supported by the Anthropic API; base64 is the universal format. |
-| `LinePlatform::reply` | Always Push API (`/v2/bot/message/push`), never Reply Token API. | LINE reply tokens expire in ~1 minute; AI latency exceeds that. |
+| `LinePlatform::reply` | Reply API first (`/v2/bot/message/reply`, free — no quota), Push API fallback (`/v2/bot/message/push`, counted) if reply token expired (>25 s) or already consumed. | Reply tokens are valid ~30 s from webhook receipt. In batch mode most responses finish within the window and cost zero quota. |
 | `LinePlatform::send_attachment` | Requires injected `MediaPublisher`. | LINE Messaging API only accepts public HTTPS URLs, not binary upload. |
 | `SlackPlatform::run_once` | Always ack the envelope within 3 s of receipt. | Slack disconnects sockets that don't ack. |
 | `daemon::LockGuard` | `Box::leak`s the inner `RwLock`. | `fd_lock`'s write-guard borrows from the lock; leaking lets us hold for process lifetime with `'static`. |
