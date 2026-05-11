@@ -11,3 +11,4 @@ serde.workspace = true
 serde_json.workspace = true
 tokio = { workspace = true, features = ["sync"] }
 thiserror.workspace = true
+tempfile.workspace = true

@@ -339,4 +339,96 @@ mod tests {
             "{}"
         );
     }
+
+    #[test]
+    fn copy_dir_recursive_nested() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        std::fs::create_dir_all(src.join("a/b")).unwrap();
+        std::fs::write(src.join("top.txt"), b"top").unwrap();
+        std::fs::write(src.join("a/mid.txt"), b"mid").unwrap();
+        std::fs::write(src.join("a/b/deep.txt"), b"deep").unwrap();
+        let dst = tmp.path().join("dst");
+        copy_dir_recursive(&src, &dst).unwrap();
+        assert_eq!(std::fs::read_to_string(dst.join("top.txt")).unwrap(), "top");
+        assert_eq!(
+            std::fs::read_to_string(dst.join("a/mid.txt")).unwrap(),
+            "mid"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dst.join("a/b/deep.txt")).unwrap(),
+            "deep"
+        );
+    }
+
+    // ── set_override tests ─────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn set_override_model() {
+        let agent = ClaudeCodeAgent::new(ClaudeCodeConfig::default());
+        let key = SessionKey::new("test", "u1");
+        agent.set_override(&key, "model", "opus").await.unwrap();
+        let cfg = agent.cfg.read().await;
+        assert_eq!(cfg.model.as_deref(), Some("opus"));
+    }
+
+    #[tokio::test]
+    async fn set_override_model_empty_clears() {
+        let agent = ClaudeCodeAgent::new(ClaudeCodeConfig {
+            model: Some("sonnet".into()),
+            ..Default::default()
+        });
+        let key = SessionKey::new("test", "u1");
+        agent.set_override(&key, "model", "").await.unwrap();
+        let cfg = agent.cfg.read().await;
+        assert!(cfg.model.is_none());
+    }
+
+    #[tokio::test]
+    async fn set_override_effort_valid() {
+        let agent = ClaudeCodeAgent::new(ClaudeCodeConfig::default());
+        let key = SessionKey::new("test", "u1");
+        for val in &["low", "medium", "high", "xhigh", "max"] {
+            agent.set_override(&key, "effort", val).await.unwrap();
+        }
+        let cfg = agent.cfg.read().await;
+        assert_eq!(cfg.effort.as_deref(), Some("max"));
+    }
+
+    #[tokio::test]
+    async fn set_override_effort_invalid_rejected() {
+        let agent = ClaudeCodeAgent::new(ClaudeCodeConfig::default());
+        let key = SessionKey::new("test", "u1");
+        let res = agent.set_override(&key, "effort", "turbo").await;
+        assert!(res.is_err());
+    }
+
+    #[tokio::test]
+    async fn set_override_budget() {
+        let agent = ClaudeCodeAgent::new(ClaudeCodeConfig::default());
+        let key = SessionKey::new("test", "u1");
+        agent.set_override(&key, "budget", "5.0").await.unwrap();
+        let cfg = agent.cfg.read().await;
+        assert_eq!(cfg.max_budget_usd, Some(5.0));
+    }
+
+    #[tokio::test]
+    async fn set_override_add_dir() {
+        let agent = ClaudeCodeAgent::new(ClaudeCodeConfig::default());
+        let key = SessionKey::new("test", "u1");
+        agent
+            .set_override(&key, "add_dir", "/tmp/foo")
+            .await
+            .unwrap();
+        let cfg = agent.cfg.read().await;
+        assert_eq!(cfg.add_dirs.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn set_override_unknown_rejected() {
+        let agent = ClaudeCodeAgent::new(ClaudeCodeConfig::default());
+        let key = SessionKey::new("test", "u1");
+        let res = agent.set_override(&key, "nonexistent", "val").await;
+        assert!(res.is_err());
+    }
 }

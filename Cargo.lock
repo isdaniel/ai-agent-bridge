@@ -596,6 +596,7 @@ dependencies = [
  "async-trait",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror 2.0.18",
  "tokio",
 ]
@@ -1894,7 +1895,9 @@ dependencies = [
  "async-trait",
  "bytes",
  "core-traits",
+ "dashmap",
  "futures-util",
+ "media-publisher",
  "reqwest 0.13.3",
  "serde",
  "serde_json",

@@ -291,40 +291,9 @@ async fn build_platform(name: &str, cfg: &AppConfig) -> Result<Arc<dyn Platform>
                     .unwrap_or_else(|| "0.0.0.0:8080".into()),
                 allowlist: p.allowlist.clone().unwrap_or_default(),
             });
-            #[cfg(feature = "media-local")]
             if let Some(media) = &p.media {
-                if media.kind.as_deref() == Some("local-http") {
-                    use media_publisher::local_http::LocalHttpPublisher;
-                    let bind: std::net::SocketAddr = media
-                        .bind
-                        .as_deref()
-                        .unwrap_or("0.0.0.0:8081")
-                        .parse()
-                        .map_err(|e| anyhow!("invalid media bind: {e}"))?;
-                    let public = url::Url::parse(
-                        media
-                            .public_base_url
-                            .as_deref()
-                            .ok_or_else(|| anyhow!("media.public_base_url required"))?,
-                    )?;
-                    let publisher = LocalHttpPublisher::spawn(bind, public).await?;
-                    platform = platform.with_publisher(publisher);
-                }
-            }
-            #[cfg(feature = "media-azure")]
-            if let Some(media) = &p.media {
-                if media.kind.as_deref() == Some("azure-blob") {
-                    use media_publisher::azure_blob::AzureBlobPublisher;
-                    let cs_env = media
-                        .connection_string_env
-                        .as_deref()
-                        .unwrap_or("AZURE_STORAGE_CONNECTION_STRING");
-                    let cs = env_or(Some(cs_env), "AZURE_STORAGE_CONNECTION_STRING")?;
-                    let container = media.container.as_deref().unwrap_or("aab-media");
-                    let expiry =
-                        std::time::Duration::from_secs(media.sas_expiry_secs.unwrap_or(3600));
-                    let publisher = AzureBlobPublisher::new(&cs, container, expiry)?;
-                    platform = platform.with_publisher(std::sync::Arc::new(publisher));
+                if let Some(pub_) = build_publisher(media).await? {
+                    platform = platform.with_publisher(pub_);
                 }
             }
             Ok(Arc::new(platform))
@@ -333,10 +302,16 @@ async fn build_platform(name: &str, cfg: &AppConfig) -> Result<Arc<dyn Platform>
         "slack" => {
             use platform_slack::{SlackConfig, SlackPlatform};
             let p = cfg.platforms.slack.clone().unwrap_or_default();
-            Ok(Arc::new(SlackPlatform::new(SlackConfig {
+            let mut platform = SlackPlatform::new(SlackConfig {
                 app_token: env_or(p.app_token_env.as_deref(), "SLACK_APP_TOKEN")?,
                 bot_token: env_or(p.bot_token_env.as_deref(), "SLACK_BOT_TOKEN")?,
-            })))
+            });
+            if let Some(media) = &p.media {
+                if let Some(pub_) = build_publisher(media).await? {
+                    platform = platform.with_publisher(pub_);
+                }
+            }
+            Ok(Arc::new(platform))
         }
         other => Err(anyhow!("platform `{other}` not enabled in this build")),
     }
@@ -345,6 +320,46 @@ async fn build_platform(name: &str, cfg: &AppConfig) -> Result<Arc<dyn Platform>
 fn env_or(name: Option<&str>, fallback: &str) -> Result<String> {
     let key = name.unwrap_or(fallback);
     std::env::var(key).with_context(|| format!("env var `{key}` not set"))
+}
+
+#[allow(unused_variables)]
+async fn build_publisher(
+    media: &config::MediaSection,
+) -> Result<Option<Arc<dyn media_publisher::MediaPublisher>>> {
+    match media.kind.as_deref() {
+        #[cfg(feature = "media-local")]
+        Some("local-http") => {
+            use media_publisher::local_http::LocalHttpPublisher;
+            let bind: std::net::SocketAddr = media
+                .bind
+                .as_deref()
+                .unwrap_or("0.0.0.0:8081")
+                .parse()
+                .map_err(|e| anyhow!("invalid media bind: {e}"))?;
+            let public = url::Url::parse(
+                media
+                    .public_base_url
+                    .as_deref()
+                    .ok_or_else(|| anyhow!("media.public_base_url required"))?,
+            )?;
+            let publisher = LocalHttpPublisher::spawn(bind, public).await?;
+            Ok(Some(publisher))
+        }
+        #[cfg(feature = "media-azure")]
+        Some("azure-blob") => {
+            use media_publisher::azure_blob::AzureBlobPublisher;
+            let cs_env = media
+                .connection_string_env
+                .as_deref()
+                .unwrap_or("AZURE_STORAGE_CONNECTION_STRING");
+            let cs = env_or(Some(cs_env), "AZURE_STORAGE_CONNECTION_STRING")?;
+            let container = media.container.as_deref().unwrap_or("aab-media");
+            let expiry = std::time::Duration::from_secs(media.sas_expiry_secs.unwrap_or(3600));
+            let publisher = AzureBlobPublisher::new(&cs, container, expiry)?;
+            Ok(Some(Arc::new(publisher)))
+        }
+        _ => Ok(None),
+    }
 }
 
 async fn session_action(cfg: AppConfig, action: SessionAction) -> Result<()> {

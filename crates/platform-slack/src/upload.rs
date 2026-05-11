@@ -25,6 +25,7 @@ pub async fn upload_file(
     http: &reqwest::Client,
     bot_token: &str,
     channel: &str,
+    thread_ts: Option<&str>,
     bytes: bytes::Bytes,
     filename: &str,
 ) -> anyhow::Result<String> {
@@ -56,13 +57,17 @@ pub async fn upload_file(
         return Err(anyhow!("PUT to upload_url failed: HTTP {}", put.status()));
     }
 
+    let mut complete_body = serde_json::json!({
+        "files": [{ "id": file_id, "title": filename }],
+        "channel_id": channel,
+    });
+    if let Some(ts) = thread_ts {
+        complete_body["thread_ts"] = serde_json::Value::String(ts.to_string());
+    }
     let complete: CompleteResp = http
         .post("https://slack.com/api/files.completeUploadExternal")
         .bearer_auth(bot_token)
-        .json(&serde_json::json!({
-            "files": [{ "id": file_id, "title": filename }],
-            "channel_id": channel,
-        }))
+        .json(&complete_body)
         .send()
         .await
         .context("completeUploadExternal request")?

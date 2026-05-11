@@ -653,9 +653,69 @@ fn expand_simple(template: &str, args: &[&str]) -> String {
 }
 
 fn now_ms() -> i64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
+    core_traits::now_ms()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use core_traits::{Message, SessionKey};
+    use std::sync::Arc;
+    use test_support::{EchoAgent, MockPlatform};
+
+    #[test]
+    fn expand_simple_basic_template() {
+        let result = expand_simple("say {{1}}", &["hello"]);
+        assert_eq!(result, "say hello");
+    }
+
+    #[test]
+    fn expand_simple_with_star_and_args() {
+        let result = expand_simple("{{1}}: {{2*}}", &["TODO", "fix", "the", "bug"]);
+        assert_eq!(result, "TODO: fix the bug");
+    }
+
+    #[test]
+    fn expand_simple_args_alias() {
+        let result = expand_simple("→ {{args}}", &["a", "b"]);
+        assert_eq!(result, "→ a b");
+    }
+
+    #[tokio::test]
+    async fn stale_event_ignored() {
+        let platform = Arc::new(MockPlatform::new("t"));
+        let engine = Engine::builder()
+            .add_agent(Arc::new(EchoAgent))
+            .default_agent("echo")
+            .platform(platform.clone())
+            .build()
+            .unwrap();
+        let msg = Message {
+            key: SessionKey::new("t", "u1"),
+            text: "stale".into(),
+            attachments: vec![],
+            reply_ctx: ReplyCtx::default(),
+            timestamp_ms: 1, // way before boot_time_ms
+        };
+        engine.dispatch(msg).await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let replies = platform.replies().await;
+        assert!(replies.is_empty(), "stale event should be silently dropped");
+    }
+
+    #[tokio::test]
+    async fn switch_agent_success() {
+        let platform = Arc::new(MockPlatform::new("t"));
+        let engine = Engine::builder()
+            .add_agent(Arc::new(EchoAgent))
+            .add_agent(Arc::new(test_support::EchoAgent)) // re-registering won't work with same name
+            .default_agent("echo")
+            .platform(platform.clone())
+            .build()
+            .unwrap();
+        let key = SessionKey::new("t", "u1");
+        // Switch to echo (same agent) should succeed since it's registered.
+        let res = engine.switch_agent(&key, "echo").await;
+        assert!(res.is_ok());
+    }
 }

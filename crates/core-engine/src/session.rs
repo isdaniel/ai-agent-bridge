@@ -25,7 +25,7 @@ use crate::registry::SessionRegistry;
 const INBOX_CAP: usize = 32;
 const FLUSH_INTERVAL: Duration = Duration::from_millis(1200);
 const FLUSH_THRESHOLD_BYTES: usize = 240;
-const THINKING_INTERVAL: Duration = Duration::from_secs(15);
+const THINKING_INTERVAL: Duration = Duration::from_secs(10);
 
 #[derive(Debug)]
 pub enum Cmd {
@@ -255,13 +255,18 @@ async fn handle_event(
         Event::AssistantAttachment(att) => {
             state.flush(platform, reply_ctx).await;
             if let Err(e) = platform.send_attachment(reply_ctx, &att).await {
-                warn!(error = %e, "send_attachment failed");
+                warn!(error = %e, path = %att.path.display(), "send_attachment failed");
+                let msg = format!(
+                    "file upload failed for `{}`: {e}",
+                    att.name.as_deref().unwrap_or("file")
+                );
+                let _ = platform.reply(reply_ctx, &msg).await;
             }
         }
         Event::PermissionRequest(req) => {
             state.flush(platform, reply_ctx).await;
             let body = format!(
-                "🔐 permission for `{}` (id={})\n{}\nReply `/yes {}` or `/no {}` to decide.",
+                "permission for `{}` (id={})\n{}\nReply `/yes {}` or `/no {}` to decide.",
                 req.tool_name, req.id, req.description, req.id, req.id
             );
             let _ = platform.reply(reply_ctx, &body).await;
@@ -289,5 +294,139 @@ async fn handle_event(
                 let _ = reg.persist().await;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── StreamState unit tests ────────────────────────────────────────────
+
+    #[test]
+    fn append_partial_sets_buffering_since() {
+        let mut s = StreamState::new(false);
+        assert!(s.buffering_since.is_none());
+        s.append_partial("hello");
+        assert!(s.buffering_since.is_some());
+        assert_eq!(s.buf, "hello");
+    }
+
+    #[test]
+    fn append_partial_empty_text_is_noop() {
+        let mut s = StreamState::new(false);
+        s.append_partial("");
+        assert!(s.buffering_since.is_none());
+        assert!(s.buf.is_empty());
+    }
+
+    #[test]
+    fn should_flush_false_when_under_threshold() {
+        let mut s = StreamState::new(false);
+        s.append_partial("short");
+        assert!(!s.should_flush());
+    }
+
+    #[test]
+    fn should_flush_true_when_over_threshold() {
+        let mut s = StreamState::new(false);
+        s.append_partial(&"x".repeat(FLUSH_THRESHOLD_BYTES + 1));
+        assert!(s.should_flush());
+    }
+
+    #[test]
+    fn should_flush_false_in_batch_mode() {
+        let mut s = StreamState::new(true);
+        s.append_partial(&"x".repeat(FLUSH_THRESHOLD_BYTES + 100));
+        assert!(!s.should_flush());
+    }
+
+    #[test]
+    fn discard_buffer_clears_all() {
+        let mut s = StreamState::new(false);
+        s.append_partial("data");
+        assert!(!s.buf.is_empty());
+        assert!(s.buffering_since.is_some());
+        s.discard_buffer();
+        assert!(s.buf.is_empty());
+        assert!(s.buffering_since.is_none());
+    }
+
+    #[tokio::test]
+    async fn flush_sends_text_and_clears_buffer() {
+        let platform = Arc::new(test_support::MockPlatform::new("t"));
+        let ctx = ReplyCtx::default();
+        let mut s = StreamState::new(false);
+        s.append_partial("hello world");
+        s.flush(&(platform.clone() as Arc<dyn Platform>), &ctx)
+            .await;
+        assert!(s.buf.is_empty());
+        assert!(s.buffering_since.is_none());
+        let replies = platform.replies().await;
+        assert_eq!(replies.len(), 1);
+        assert_eq!(replies[0].text, "hello world");
+    }
+
+    #[tokio::test]
+    async fn flush_skips_whitespace_only() {
+        let platform = Arc::new(test_support::MockPlatform::new("t"));
+        let ctx = ReplyCtx::default();
+        let mut s = StreamState::new(false);
+        s.append_partial("   \n  ");
+        s.flush(&(platform.clone() as Arc<dyn Platform>), &ctx)
+            .await;
+        let replies = platform.replies().await;
+        assert!(replies.is_empty());
+        assert!(s.buf.is_empty());
+    }
+
+    #[test]
+    fn mark_processing_idempotent() {
+        let mut s = StreamState::new(true);
+        assert!(!s.processing);
+        s.mark_processing();
+        assert!(s.processing);
+        let first_ts = s.last_thinking;
+        s.mark_processing();
+        assert_eq!(s.last_thinking, first_ts);
+    }
+
+    #[test]
+    fn clear_processing_resets_state() {
+        let mut s = StreamState::new(true);
+        s.mark_processing();
+        s.thinking_count = 5;
+        s.clear_processing();
+        assert!(!s.processing);
+        assert!(s.last_thinking.is_none());
+        assert_eq!(s.thinking_count, 0);
+    }
+
+    #[test]
+    fn next_deadline_none_when_idle_streaming() {
+        let s = StreamState::new(false);
+        assert!(s.next_deadline().is_none());
+    }
+
+    #[test]
+    fn next_deadline_none_when_idle_batch() {
+        let s = StreamState::new(true);
+        assert!(s.next_deadline().is_none());
+    }
+
+    #[test]
+    fn next_deadline_returns_thinking_interval_in_batch_processing() {
+        let mut s = StreamState::new(true);
+        s.mark_processing();
+        let deadline = s.next_deadline();
+        assert!(deadline.is_some());
+    }
+
+    #[test]
+    fn next_deadline_returns_flush_interval_when_buffered_streaming() {
+        let mut s = StreamState::new(false);
+        s.append_partial("data");
+        let deadline = s.next_deadline();
+        assert!(deadline.is_some());
     }
 }

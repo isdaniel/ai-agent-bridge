@@ -7,12 +7,40 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
 pub type Result<T> = std::result::Result<T, anyhow::Error>;
+
+/// Milliseconds since the Unix epoch. Used for boot-time and event timestamps.
+pub fn now_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+/// Write `bytes` to a temp directory under a safe `name`, returning the path.
+///
+/// Creates a new temporary directory (leaked so the path outlives this call),
+/// validates that `name` doesn't escape the directory, and writes the bytes.
+/// Use [`safe_filename`] to sanitise user-supplied names before calling.
+pub fn write_temp_file(name: &str, bytes: &[u8]) -> Result<PathBuf> {
+    if name.is_empty() || name.contains('/') || name.contains('\\') || name.contains('\0') {
+        anyhow::bail!("refusing unsafe filename");
+    }
+    let dir = tempfile::tempdir()?;
+    let dir_path = dir.keep();
+    let path = dir_path.join(name);
+    if !path.starts_with(&dir_path) {
+        anyhow::bail!("path escaped tempdir");
+    }
+    std::fs::write(&path, bytes)?;
+    Ok(path)
+}
 
 /// Namespaced per-user identity, e.g. `"line:U1234"`, `"slack:T1/C1/U1"`,
 /// `"stdio:local"`. The string form is what gets serialized to the registry.
@@ -276,5 +304,39 @@ mod tests {
         let out = safe_filename(&huge);
         assert!(out.len() <= 200);
         assert!(out.chars().all(|c| c == 'a'));
+    }
+
+    #[test]
+    fn session_key_no_colon_returns_none() {
+        let k = SessionKey("nocolon".into());
+        assert!(k.platform().is_none());
+    }
+
+    #[test]
+    fn session_key_empty_returns_none() {
+        let k = SessionKey(String::new());
+        assert!(k.platform().is_none());
+    }
+
+    #[test]
+    fn now_ms_returns_positive() {
+        assert!(now_ms() > 0);
+    }
+
+    #[test]
+    fn write_temp_file_creates_file() {
+        let path = write_temp_file("test.txt", b"hello").unwrap();
+        assert!(path.exists());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "hello");
+    }
+
+    #[test]
+    fn write_temp_file_rejects_slash() {
+        assert!(write_temp_file("a/b", b"x").is_err());
+    }
+
+    #[test]
+    fn write_temp_file_rejects_empty_name() {
+        assert!(write_temp_file("", b"x").is_err());
     }
 }

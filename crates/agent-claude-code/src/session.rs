@@ -3,7 +3,6 @@
 use std::path::Path;
 use std::process::Stdio;
 use std::sync::Arc;
-use std::time::Duration;
 
 use anyhow::{anyhow, Context};
 use async_trait::async_trait;
@@ -16,13 +15,12 @@ use serde_json::json;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
 use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::{mpsc, oneshot, Mutex};
-use tracing::{debug, info, warn};
+use tracing::{debug, warn};
 
 use crate::stream_event::{ContentBlock, ControlReq, PartialDelta, PartialEvent, StreamEvent};
 use crate::{ClaudeCodeConfig, PermissionMode};
 
-const EVENTS_CAP: usize = 64;
-const SHUTDOWN_GRACE: Duration = Duration::from_secs(120);
+use core_engine::framing::{EVENTS_CAP, SHUTDOWN_GRACE};
 
 pub struct ClaudeCodeSession {
     session_id: Arc<std::sync::RwLock<String>>,
@@ -234,7 +232,6 @@ impl AgentSession for ClaudeCodeSession {
     }
 
     async fn close(mut self: Box<Self>) -> Result<()> {
-        // Send interrupt, wait grace, then kill.
         {
             let mut w = self.stdin.lock().await;
             let _ = core_engine::framing::write_ndjson(
@@ -245,14 +242,7 @@ impl AgentSession for ClaudeCodeSession {
             let _ = w.shutdown().await;
         }
         if let Some(mut child) = self.child.take() {
-            match tokio::time::timeout(SHUTDOWN_GRACE, child.wait()).await {
-                Ok(Ok(status)) if status.success() => info!("claude exited cleanly"),
-                Ok(Ok(status)) => warn!(code = ?status.code(), "claude exited with error"),
-                _ => {
-                    warn!("claude shutdown grace exceeded; killing");
-                    let _ = child.start_kill();
-                }
-            }
+            core_engine::framing::shutdown_child(&mut child, SHUTDOWN_GRACE).await;
         }
         Ok(())
     }
@@ -627,6 +617,129 @@ mod tests {
         let text = "Try /new or /help for more options.";
         let paths = find_absolute_paths(text);
         assert!(paths.is_empty());
+    }
+
+    // ── translate_event tests ────────────────────────────────────────────
+
+    fn make_sid() -> Arc<std::sync::RwLock<String>> {
+        Arc::new(std::sync::RwLock::new("initial".to_string()))
+    }
+    fn make_pending() -> Arc<DashMap<String, oneshot::Sender<bool>>> {
+        Arc::new(DashMap::new())
+    }
+
+    #[tokio::test]
+    async fn translate_system_event_updates_session_id() {
+        let sid = make_sid();
+        let pending = make_pending();
+        let (_, _r) = tokio::io::duplex(64);
+        let stdin = Arc::new(Mutex::new(BufWriter::new(
+            tokio::process::Command::new("true")
+                .stdin(std::process::Stdio::piped())
+                .spawn()
+                .unwrap()
+                .stdin
+                .take()
+                .unwrap(),
+        )));
+        let evts = translate_event(
+            StreamEvent::System {
+                subtype: Some("init".into()),
+                session_id: Some("new-id".into()),
+                rest: serde_json::Value::Null,
+            },
+            &sid,
+            &pending,
+            &stdin,
+        )
+        .await;
+        assert!(evts.is_none());
+        assert_eq!(*sid.read().unwrap(), "new-id");
+    }
+
+    #[tokio::test]
+    async fn translate_result_error_emits_events() {
+        let sid = make_sid();
+        let pending = make_pending();
+        let stdin = Arc::new(Mutex::new(BufWriter::new(
+            tokio::process::Command::new("true")
+                .stdin(std::process::Stdio::piped())
+                .spawn()
+                .unwrap()
+                .stdin
+                .take()
+                .unwrap(),
+        )));
+        let evts = translate_event(
+            StreamEvent::Result {
+                subtype: None,
+                session_id: Some("s1".into()),
+                is_error: Some(true),
+                errors: Some(vec!["oops".into()]),
+                rest: serde_json::Value::Null,
+            },
+            &sid,
+            &pending,
+            &stdin,
+        )
+        .await;
+        let events = evts.unwrap();
+        assert!(events.len() >= 2);
+        assert!(matches!(&events[0], Event::Error(msg) if msg == "oops"));
+        assert!(matches!(&events[1], Event::Done { session_id } if session_id == "s1"));
+    }
+
+    #[tokio::test]
+    async fn translate_result_done_no_error() {
+        let sid = make_sid();
+        let pending = make_pending();
+        let stdin = Arc::new(Mutex::new(BufWriter::new(
+            tokio::process::Command::new("true")
+                .stdin(std::process::Stdio::piped())
+                .spawn()
+                .unwrap()
+                .stdin
+                .take()
+                .unwrap(),
+        )));
+        let evts = translate_event(
+            StreamEvent::Result {
+                subtype: None,
+                session_id: Some("s2".into()),
+                is_error: None,
+                errors: None,
+                rest: serde_json::Value::Null,
+            },
+            &sid,
+            &pending,
+            &stdin,
+        )
+        .await;
+        let events = evts.unwrap();
+        assert_eq!(events.len(), 1);
+        assert!(matches!(&events[0], Event::Done { session_id } if session_id == "s2"));
+    }
+
+    #[test]
+    fn extract_file_attachments_deduplicates() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dup.xlsx");
+        std::fs::write(&path, b"PK").unwrap();
+        let text = format!("File at {} and again at {}", path.display(), path.display());
+        let atts = extract_file_attachments(&text);
+        assert_eq!(atts.len(), 1);
+    }
+
+    #[test]
+    fn mime_for_ext_covers_common_types() {
+        assert!(mime_for_ext("png").is_some());
+        assert!(mime_for_ext("jpg").is_some());
+        assert!(mime_for_ext("pdf").is_some());
+        assert!(mime_for_ext("xlsx").is_some());
+        assert!(mime_for_ext("csv").is_some());
+        assert!(mime_for_ext("zip").is_some());
+        assert!(mime_for_ext("rs").is_none());
+        assert!(mime_for_ext("py").is_none());
     }
 }
 

@@ -1,5 +1,5 @@
 //! Newline-delimited JSON framing helpers shared by stream-json (Claude Code)
-//! and ACP transports.
+//! and ACP transports. Also hosts shared agent-process lifecycle utilities.
 
 use anyhow::Result;
 use futures_util::StreamExt;
@@ -8,10 +8,16 @@ use serde::Serialize;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::sync::mpsc;
 use tokio_util::codec::{FramedRead, LinesCodec};
-use tracing::warn;
+use tracing::{info, warn};
 
 /// 8 MiB default — large enough to carry inline base64 images.
 pub const DEFAULT_MAX_LINE: usize = 8 * 1024 * 1024;
+
+/// Default capacity for per-session event channels.
+pub const EVENTS_CAP: usize = 64;
+
+/// Default grace period before force-killing an agent subprocess.
+pub const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(120);
 
 /// Spawn a reader task that decodes one JSON value per line and forwards
 /// successfully parsed values into `tx`. Parse errors are logged and skipped
@@ -66,6 +72,19 @@ fn truncate(s: &str, n: usize) -> String {
         s.to_string()
     } else {
         format!("{}…", &s[..n])
+    }
+}
+
+/// Wait for `child` to exit within `grace`, then force-kill.
+/// Shared by both `agent-claude-code` and `agent-acp` close paths.
+pub async fn shutdown_child(child: &mut tokio::process::Child, grace: std::time::Duration) {
+    match tokio::time::timeout(grace, child.wait()).await {
+        Ok(Ok(status)) if status.success() => info!("agent exited cleanly"),
+        Ok(Ok(status)) => warn!(code = ?status.code(), "agent exited with error"),
+        _ => {
+            warn!("agent shutdown grace exceeded; killing");
+            let _ = child.start_kill();
+        }
     }
 }
 

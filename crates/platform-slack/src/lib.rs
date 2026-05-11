@@ -18,8 +18,10 @@ use core_traits::{
     safe_filename, Attachment, AttachmentKind, Message, MessageHandler, Platform, ReplyCtx, Result,
     SessionKey,
 };
+use dashmap::DashMap;
 use envelope::{Envelope, EventsApiPayload, MessageEvent, SlackEvent, SlackFile};
 use futures_util::{SinkExt, StreamExt};
+use media_publisher::MediaPublisher;
 use serde::Deserialize;
 use tokio::time::sleep;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
@@ -37,6 +39,10 @@ pub struct SlackPlatform {
     cfg: SlackConfig,
     http: reqwest::Client,
     bot_user_id: tokio::sync::OnceCell<String>,
+    /// Tracks posted "thinking" indicator messages: `"channel:thread_ts"` → message `ts`.
+    /// Cleaned up when `reply` or `send_attachment` is called.
+    thinking_messages: DashMap<String, String>,
+    publisher: Option<Arc<dyn MediaPublisher>>,
 }
 
 impl SlackPlatform {
@@ -45,7 +51,14 @@ impl SlackPlatform {
             cfg,
             http: reqwest::Client::new(),
             bot_user_id: tokio::sync::OnceCell::new(),
+            thinking_messages: DashMap::new(),
+            publisher: None,
         }
+    }
+
+    pub fn with_publisher(mut self, publisher: Arc<dyn MediaPublisher>) -> Self {
+        self.publisher = Some(publisher);
+        self
     }
 
     async fn resolve_bot_user_id(&self) -> Result<&str> {
@@ -126,14 +139,7 @@ impl SlackPlatform {
         // Sanitise: file.name is uploader-controlled.
         let raw_name = file.name.clone().unwrap_or_else(|| file.id.clone());
         let name = safe_filename(&raw_name);
-        let dir = tempfile::tempdir()?;
-        let dir_path = dir.keep();
-        let path = dir_path.join(&name);
-        // Failsafe: ensure join didn't escape (shouldn't, after safe_filename).
-        if !path.starts_with(&dir_path) {
-            anyhow::bail!("slack download path escaped tempdir");
-        }
-        tokio::fs::write(&path, &bytes).await?;
+        let path = core_traits::write_temp_file(&name, &bytes)?;
         Ok(Attachment {
             kind,
             path,
@@ -141,6 +147,28 @@ impl SlackPlatform {
             bytes: Some(bytes.len() as u64),
             name: Some(name),
         })
+    }
+
+    fn thinking_key(ctx: &ReplyCtx) -> String {
+        let ch = ctx.channel.as_deref().unwrap_or("");
+        let ts = ctx.thread.as_deref().unwrap_or("");
+        format!("{ch}:{ts}")
+    }
+
+    async fn clear_thinking(&self, ctx: &ReplyCtx) {
+        let key = Self::thinking_key(ctx);
+        if let Some((_, ts)) = self.thinking_messages.remove(&key) {
+            if let Some(channel) = &ctx.channel {
+                let body = serde_json::json!({ "channel": channel, "ts": ts });
+                let _ = self
+                    .http
+                    .post("https://slack.com/api/chat.delete")
+                    .bearer_auth(&self.cfg.bot_token)
+                    .json(&body)
+                    .send()
+                    .await;
+            }
+        }
     }
 
     async fn dispatch(&self, ev: MessageEvent, handler: &Arc<dyn MessageHandler>) {
@@ -258,6 +286,47 @@ impl SlackPlatform {
         }
         Ok(())
     }
+
+    /// Send a download link using Block Kit with an explicit button.
+    async fn send_download_link(&self, ctx: &ReplyCtx, name: &str, url: &str) -> Result<()> {
+        let channel = ctx
+            .channel
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("Slack send_download_link requires channel"))?;
+        let mut body = serde_json::json!({
+            "channel": channel,
+            "text": format!("📎 {name}"),
+            "blocks": [
+                {
+                    "type": "section",
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": format!("📎 <{url}|{name}>")
+                    },
+                    "accessory": {
+                        "type": "button",
+                        "text": { "type": "plain_text", "text": "Download" },
+                        "url": url,
+                        "action_id": "download_file"
+                    }
+                }
+            ]
+        });
+        if let Some(ts) = &ctx.thread {
+            body["thread_ts"] = serde_json::Value::String(ts.clone());
+        }
+        let resp = self
+            .http
+            .post("https://slack.com/api/chat.postMessage")
+            .bearer_auth(&self.cfg.bot_token)
+            .json(&body)
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            anyhow::bail!("slack postMessage HTTP {}", resp.status());
+        }
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -268,7 +337,9 @@ impl Platform for SlackPlatform {
 
     async fn start(&self, handler: Arc<dyn MessageHandler>) -> Result<()> {
         match self.resolve_bot_user_id().await {
-            Ok(id) => info!(bot_user_id=%id, "slack bot identity resolved; mention-only in channels"),
+            Ok(id) => {
+                info!(bot_user_id=%id, "slack bot identity resolved; mention-only in channels")
+            }
             Err(e) => warn!(error=%e, "could not resolve bot user id; will retry on first message"),
         }
         let mut backoff = Duration::from_secs(1);
@@ -288,6 +359,7 @@ impl Platform for SlackPlatform {
     }
 
     async fn reply(&self, ctx: &ReplyCtx, text: &str) -> Result<()> {
+        self.clear_thinking(ctx).await;
         let channel = ctx
             .channel
             .as_deref()
@@ -313,6 +385,17 @@ impl Platform for SlackPlatform {
     }
 
     async fn send_attachment(&self, ctx: &ReplyCtx, att: &Attachment) -> Result<()> {
+        self.clear_thinking(ctx).await;
+        if let Some(publisher) = &self.publisher {
+            let url = publisher.publish(&att.path, &att.mime).await?;
+            let name = att
+                .name
+                .as_deref()
+                .or_else(|| att.path.file_name().and_then(|n| n.to_str()))
+                .unwrap_or("file");
+            self.send_download_link(ctx, name, url.as_str()).await?;
+            return Ok(());
+        }
         let channel = ctx
             .channel
             .as_deref()
@@ -331,10 +414,49 @@ impl Platform for SlackPlatform {
             &self.http,
             &self.cfg.bot_token,
             channel,
+            ctx.thread.as_deref(),
             bytes::Bytes::from(bytes),
             &filename,
         )
         .await?;
+        Ok(())
+    }
+
+    async fn show_typing(&self, ctx: &ReplyCtx) -> Result<()> {
+        let key = Self::thinking_key(ctx);
+        if self.thinking_messages.contains_key(&key) {
+            return Ok(());
+        }
+        let channel = ctx
+            .channel
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("Slack show_typing requires channel"))?;
+        let mut body = serde_json::json!({
+            "channel": channel,
+            "text": "\u{1f4ad}",
+        });
+        if let Some(ts) = &ctx.thread {
+            body["thread_ts"] = serde_json::Value::String(ts.clone());
+        }
+        #[derive(Deserialize)]
+        struct Resp {
+            ok: bool,
+            ts: Option<String>,
+        }
+        let resp: Resp = self
+            .http
+            .post("https://slack.com/api/chat.postMessage")
+            .bearer_auth(&self.cfg.bot_token)
+            .json(&body)
+            .send()
+            .await?
+            .json()
+            .await?;
+        if resp.ok {
+            if let Some(ts) = resp.ts {
+                self.thinking_messages.insert(key, ts);
+            }
+        }
         Ok(())
     }
 }

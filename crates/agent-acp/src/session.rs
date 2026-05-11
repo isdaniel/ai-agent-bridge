@@ -13,7 +13,6 @@
 
 use std::process::Stdio;
 use std::sync::Arc;
-use std::time::Duration;
 
 use anyhow::{anyhow, Context};
 use async_trait::async_trait;
@@ -34,8 +33,7 @@ use crate::protocol::{
 };
 use crate::AcpConfig;
 
-const EVENTS_CAP: usize = 64;
-const SHUTDOWN_GRACE: Duration = Duration::from_secs(120);
+use core_engine::framing::{EVENTS_CAP, SHUTDOWN_GRACE};
 
 pub struct AcpSession {
     session_id: Arc<RwLock<String>>,
@@ -351,13 +349,7 @@ impl AgentSession for AcpSession {
             let _ = w.shutdown().await;
         }
         if let Some(mut child) = self.child.take() {
-            match tokio::time::timeout(SHUTDOWN_GRACE, child.wait()).await {
-                Ok(_) => info!("acp agent exited"),
-                Err(_) => {
-                    warn!("acp shutdown grace exceeded; killing");
-                    let _ = child.start_kill();
-                }
-            }
+            core_engine::framing::shutdown_child(&mut child, SHUTDOWN_GRACE).await;
         }
         Ok(())
     }

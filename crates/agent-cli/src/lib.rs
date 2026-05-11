@@ -52,6 +52,7 @@ impl Agent for CliAgent {
     }
 }
 
+/// Per-message subprocess session.
 pub struct CliSession {
     cfg: Arc<CliAgentConfig>,
     session_id: Arc<Mutex<String>>,
@@ -133,5 +134,54 @@ impl AgentSession for CliSession {
 
     async fn close(self: Box<Self>) -> Result<()> {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn cli_session_id_uses_resume_when_provided() {
+        let cfg = CliAgentConfig {
+            binary: "echo".into(),
+            args: vec![],
+            supports_resume: false,
+        };
+        let agent = CliAgent::new("test", cfg);
+        let key = SessionKey::new("test", "u1");
+        let session = agent
+            .start_session(key, Some("prev-id".into()))
+            .await
+            .unwrap();
+        assert_eq!(session.id(), "prev-id");
+    }
+
+    #[tokio::test]
+    async fn cli_session_events_returns_receiver() {
+        let cfg = CliAgentConfig {
+            binary: "echo".into(),
+            args: vec![],
+            supports_resume: false,
+        };
+        let agent = CliAgent::new("test", cfg);
+        let key = SessionKey::new("test", "u1");
+        let mut session = agent.start_session(key, None).await.unwrap();
+        let _rx = session.events();
+    }
+
+    #[tokio::test]
+    async fn cli_session_generates_uuid_without_resume() {
+        let cfg = CliAgentConfig {
+            binary: "echo".into(),
+            args: vec![],
+            supports_resume: false,
+        };
+        let agent = CliAgent::new("test", cfg);
+        let key = SessionKey::new("test", "u1");
+        let session = agent.start_session(key, None).await.unwrap();
+        let id = session.id();
+        assert!(!id.is_empty());
+        assert!(uuid::Uuid::parse_str(&id).is_ok());
     }
 }

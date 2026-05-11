@@ -211,4 +211,39 @@ mod tests {
         assert!(reg.agent_for(&k).is_none());
         assert!(reg.last_session_id(&k).is_none());
     }
+
+    #[test]
+    fn set_agent_same_agent_noop() {
+        let mut reg = SessionRegistry::in_memory();
+        let k = SessionKey::new("line", "U1");
+        reg.record_session(k.clone(), "claude".into(), "s1".into());
+        reg.set_agent(k.clone(), "claude".into());
+        let e = reg.entries.get(&k).unwrap();
+        assert_eq!(e.agent, "claude");
+        assert_eq!(e.active_session_id.as_deref(), Some("s1"));
+        assert!(e.past_agent_session_ids.is_empty());
+    }
+
+    #[test]
+    fn set_agent_different_agent_archives_previous() {
+        let mut reg = SessionRegistry::in_memory();
+        let k = SessionKey::new("line", "U1");
+        reg.record_session(k.clone(), "claude".into(), "s1".into());
+        reg.set_agent(k.clone(), "copilot".into());
+        let e = reg.entries.get(&k).unwrap();
+        assert_eq!(e.agent, "copilot");
+        assert!(e.active_session_id.is_none());
+        assert_eq!(e.past_agent_session_ids.len(), 1);
+        assert_eq!(e.past_agent_session_ids[0], ("claude".into(), "s1".into()));
+    }
+
+    #[test]
+    fn record_session_same_id_no_duplicate_history() {
+        let mut reg = SessionRegistry::in_memory();
+        let k = SessionKey::new("line", "U1");
+        reg.record_session(k.clone(), "claude".into(), "s1".into());
+        reg.record_session(k.clone(), "claude".into(), "s1".into());
+        let e = reg.entries.get(&k).unwrap();
+        assert!(e.past_agent_session_ids.is_empty());
+    }
 }

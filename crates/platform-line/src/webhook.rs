@@ -135,7 +135,7 @@ async fn build_payload(state: &AppState, m: &EventMessage) -> (String, Vec<Attac
                     });
                     // Sanitise: LINE-supplied fileName is sender-controlled.
                     let name = safe_filename(&raw_name);
-                    match write_temp(&name, &bytes) {
+                    match core_traits::write_temp_file(&name, &bytes) {
                         Ok(path) => (
                             String::new(),
                             vec![Attachment {
@@ -187,24 +187,6 @@ async fn download_content(
         .to_string();
     let bytes = resp.bytes().await?.to_vec();
     Ok((bytes, mime))
-}
-
-fn write_temp(name: &str, bytes: &[u8]) -> anyhow::Result<std::path::PathBuf> {
-    // Defence-in-depth: even though callers run safe_filename(), refuse any
-    // residual separator or NUL so a future caller can't accidentally bypass.
-    if name.is_empty() || name.contains('/') || name.contains('\\') || name.contains('\0') {
-        anyhow::bail!("refusing unsafe filename");
-    }
-    let dir = tempfile::tempdir()?;
-    // Promote to a leaked dir so the path stays alive past this scope.
-    let dir_path = dir.keep();
-    let path = dir_path.join(name);
-    // After join, double-check the result is still under dir_path.
-    if !path.starts_with(&dir_path) {
-        anyhow::bail!("path escaped tempdir");
-    }
-    std::fs::write(&path, bytes)?;
-    Ok(path)
 }
 
 fn ext_from_mime(mime: &str) -> &'static str {
@@ -309,16 +291,16 @@ mod tests {
     }
 
     #[test]
-    fn write_temp_rejects_separators() {
-        assert!(write_temp("a/b", b"x").is_err());
-        assert!(write_temp("a\\b", b"x").is_err());
-        assert!(write_temp("a\0b", b"x").is_err());
-        assert!(write_temp("", b"x").is_err());
+    fn write_temp_file_rejects_separators() {
+        assert!(core_traits::write_temp_file("a/b", b"x").is_err());
+        assert!(core_traits::write_temp_file("a\\b", b"x").is_err());
+        assert!(core_traits::write_temp_file("a\0b", b"x").is_err());
+        assert!(core_traits::write_temp_file("", b"x").is_err());
     }
 
     #[test]
-    fn write_temp_writes_safe_name() {
-        let p = write_temp("ok.png", b"hello").unwrap();
+    fn write_temp_file_writes_safe_name() {
+        let p = core_traits::write_temp_file("ok.png", b"hello").unwrap();
         assert_eq!(std::fs::read(&p).unwrap(), b"hello");
         let _ = std::fs::remove_file(&p);
     }

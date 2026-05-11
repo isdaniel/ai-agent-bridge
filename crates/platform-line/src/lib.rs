@@ -178,9 +178,5 @@ impl Platform for LinePlatform {
 }
 
 fn now_ms() -> i64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
+    core_traits::now_ms()
 }

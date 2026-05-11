@@ -258,4 +258,38 @@ mod tests {
     fn parse_returns_none_without_slash() {
         assert!(parse_command_line("plain text").is_none());
     }
+
+    #[test]
+    fn tokenize_empty_string() {
+        assert!(tokenize("").is_empty());
+    }
+
+    #[test]
+    fn tokenize_only_whitespace() {
+        assert!(tokenize("   \t  ").is_empty());
+    }
+
+    #[test]
+    fn tokenize_escaped_quote_inside_quotes() {
+        let tokens = tokenize(r#""hello \"world\"""#);
+        assert_eq!(tokens, vec!["hello \"world\""]);
+    }
+
+    #[test]
+    fn expand_template_missing_positional_arg() {
+        let out = expand_template("{{1}} and {{3}}", &["only"]);
+        assert_eq!(out, "only and ");
+    }
+
+    #[test]
+    fn expand_template_zero_index_ignored() {
+        let out = expand_template("{{0}} stays", &["a"]);
+        assert_eq!(out, "{{0}} stays");
+    }
+
+    #[test]
+    fn parse_bare_slash_returns_none() {
+        assert!(parse_command_line("/").is_none());
+        assert!(parse_command_line("/  ").is_none());
+    }
 }

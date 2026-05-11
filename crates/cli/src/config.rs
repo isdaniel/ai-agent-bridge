@@ -118,6 +118,7 @@ pub struct MediaSection {
 pub struct SlackSection {
     pub app_token_env: Option<String>,
     pub bot_token_env: Option<String>,
+    pub media: Option<MediaSection>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]

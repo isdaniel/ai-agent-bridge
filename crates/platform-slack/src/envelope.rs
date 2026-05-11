@@ -154,4 +154,32 @@ mod tests {
         let env: Envelope = serde_json::from_str(raw).unwrap();
         assert_eq!(env.kind, "hello");
     }
+
+    fn msg(subtype: Option<&str>) -> MessageEvent {
+        MessageEvent {
+            channel: Some("C".into()),
+            user: Some("U".into()),
+            text: "x".into(),
+            ts: None,
+            thread_ts: None,
+            bot_id: None,
+            subtype: subtype.map(Into::into),
+            files: vec![],
+        }
+    }
+
+    #[test]
+    fn normal_message_not_skippable() {
+        assert!(!msg(None).is_skippable());
+    }
+
+    #[test]
+    fn join_channel_subtype_skippable() {
+        assert!(msg(Some("channel_join")).is_skippable());
+    }
+
+    #[test]
+    fn message_deleted_subtype_skippable() {
+        assert!(msg(Some("message_deleted")).is_skippable());
+    }
 }
