@@ -70,6 +70,16 @@ pub struct AgentSection {
     pub allowed_tools: Option<Vec<String>>,
     pub disallowed_tools: Option<Vec<String>>,
     pub mcp_config_files: Option<Vec<PathBuf>>,
+
+    // ── Per-client isolation ─────────────────────────────────────────────
+    /// Base directory for per-client workspaces. Each `SessionKey` gets a
+    /// subdirectory used as CWD for the spawned `claude` process, giving
+    /// each client its own `CLAUDE.md`, `.claude/settings.json`, and
+    /// `.mcp.json` (memory, skills, MCP isolation).
+    pub client_config_base_dir: Option<PathBuf>,
+    /// Template directory whose contents are copied into new per-client
+    /// workspaces on first use.
+    pub client_template_dir: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]

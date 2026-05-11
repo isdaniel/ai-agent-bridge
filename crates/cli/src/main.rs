@@ -192,6 +192,8 @@ fn build_agent(name: &str, cfg: &AppConfig) -> Result<Arc<dyn Agent>> {
                 mcp_config_files: a.mcp_config_files.unwrap_or_default(),
                 session_id: None,
                 inline_image_max_bytes: 256 * 1024,
+                client_config_base_dir: a.client_config_base_dir,
+                client_template_dir: a.client_template_dir,
             };
             Ok(Arc::new(ClaudeCodeAgent::new(cc)))
         }

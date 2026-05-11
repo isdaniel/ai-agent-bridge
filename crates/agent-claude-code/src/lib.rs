@@ -27,11 +27,12 @@
 pub mod session;
 pub mod stream_event;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use core_traits::{Agent, AgentSession, Result, SessionKey};
+use tracing::info;
 
 #[derive(Clone, Debug)]
 pub struct ClaudeCodeConfig {
@@ -81,6 +82,18 @@ pub struct ClaudeCodeConfig {
     // ── Attachment handling ──────────────────────────────────────────────
     /// Inline-vs-path threshold for image attachments (bytes). Default 256 KiB.
     pub inline_image_max_bytes: u64,
+
+    // ── Per-client isolation ─────────────────────────────────────────────
+    /// Base directory for per-client workspaces. When set, each `SessionKey`
+    /// gets its own subdirectory used as `cwd` for the `claude` child process.
+    /// Claude reads project-level `.claude/settings.json`, `CLAUDE.md`, and
+    /// `.mcp.json` from this directory, giving each client isolated memory,
+    /// skills, and MCP servers while sharing the host's auth credentials.
+    pub client_config_base_dir: Option<PathBuf>,
+    /// Optional template directory copied into new per-client workspaces on
+    /// first use. Put default `CLAUDE.md`, `.claude/settings.json`, `.mcp.json`
+    /// here.
+    pub client_template_dir: Option<PathBuf>,
 }
 
 impl Default for ClaudeCodeConfig {
@@ -103,6 +116,8 @@ impl Default for ClaudeCodeConfig {
             mcp_config_files: vec![],
             session_id: None,
             inline_image_max_bytes: 256 * 1024,
+            client_config_base_dir: None,
+            client_template_dir: None,
         }
     }
 }
@@ -137,7 +152,15 @@ impl Agent for ClaudeCodeAgent {
         key: SessionKey,
         resume: Option<String>,
     ) -> Result<Box<dyn AgentSession>> {
-        let snapshot = Arc::new(self.cfg.read().await.clone());
+        let mut cfg = self.cfg.read().await.clone();
+        if let Some(base) = &cfg.client_config_base_dir {
+            let dirname = session_key_to_dirname(&key);
+            let client_dir = base.join(&dirname);
+            ensure_client_dir(&client_dir, cfg.client_template_dir.as_deref())?;
+            info!(?key, dir = %client_dir.display(), "per-client workspace");
+            cfg.cwd = Some(client_dir);
+        }
+        let snapshot = Arc::new(cfg);
         session::ClaudeCodeSession::spawn(snapshot, key, resume)
             .await
             .map(|s| Box::new(s) as Box<dyn AgentSession>)
@@ -194,5 +217,120 @@ impl Agent for ClaudeCodeAgent {
             other => anyhow::bail!("unknown override `{other}`"),
         }
         Ok(())
+    }
+}
+
+/// Convert a `SessionKey` into a filesystem-safe directory name.
+/// `"line:U1234"` → `"line__U1234"`, `"slack:C1/U2"` → `"slack__C1__U2"`.
+fn session_key_to_dirname(key: &SessionKey) -> String {
+    key.0
+        .replace([':', '/'], "__")
+        .chars()
+        .filter(|c| c.is_alphanumeric() || *c == '_' || *c == '-' || *c == '.')
+        .collect()
+}
+
+/// Create the per-client workspace directory if it doesn't exist.
+/// If a template directory is provided and the client dir is new, its
+/// contents are copied recursively.
+fn ensure_client_dir(dir: &Path, template: Option<&Path>) -> Result<()> {
+    if dir.exists() {
+        return Ok(());
+    }
+    if let Some(tmpl) = template {
+        if tmpl.is_dir() {
+            copy_dir_recursive(tmpl, dir)?;
+            return Ok(());
+        }
+    }
+    std::fs::create_dir_all(dir.join(".claude"))?;
+    Ok(())
+}
+
+fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let src_path = entry.path();
+        let dst_path = dst.join(entry.file_name());
+        if src_path.is_dir() {
+            copy_dir_recursive(&src_path, &dst_path)?;
+        } else {
+            std::fs::copy(&src_path, &dst_path)?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use core_traits::SessionKey;
+
+    #[test]
+    fn dirname_from_line_key() {
+        let key = SessionKey::new("line", "U1234");
+        assert_eq!(session_key_to_dirname(&key), "line__U1234");
+    }
+
+    #[test]
+    fn dirname_from_slack_key() {
+        let key = SessionKey::new("slack", "C1/U2");
+        assert_eq!(session_key_to_dirname(&key), "slack__C1__U2");
+    }
+
+    #[test]
+    fn dirname_from_stdio_key() {
+        let key = SessionKey::new("stdio", "local");
+        assert_eq!(session_key_to_dirname(&key), "stdio__local");
+    }
+
+    #[test]
+    fn dirname_strips_unsafe_chars() {
+        let key = SessionKey(r#"line:U<>|"test""#.into());
+        let dir = session_key_to_dirname(&key);
+        assert!(!dir.contains('<'));
+        assert!(!dir.contains('>'));
+        assert!(!dir.contains('|'));
+        assert!(!dir.contains('"'));
+    }
+
+    #[test]
+    fn ensure_client_dir_creates_dot_claude() {
+        let tmp = tempfile::tempdir().unwrap();
+        let client = tmp.path().join("line__U1234");
+        ensure_client_dir(&client, None).unwrap();
+        assert!(client.join(".claude").is_dir());
+    }
+
+    #[test]
+    fn ensure_client_dir_noop_if_exists() {
+        let tmp = tempfile::tempdir().unwrap();
+        let client = tmp.path().join("existing");
+        std::fs::create_dir_all(&client).unwrap();
+        std::fs::write(client.join("marker.txt"), b"keep").unwrap();
+        ensure_client_dir(&client, None).unwrap();
+        assert!(client.join("marker.txt").exists());
+    }
+
+    #[test]
+    fn ensure_client_dir_copies_template() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tmpl = tmp.path().join("template");
+        std::fs::create_dir_all(tmpl.join(".claude")).unwrap();
+        std::fs::write(tmpl.join("CLAUDE.md"), b"hello").unwrap();
+        std::fs::write(tmpl.join(".claude/settings.json"), b"{}").unwrap();
+
+        let client = tmp.path().join("line__U999");
+        ensure_client_dir(&client, Some(&tmpl)).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(client.join("CLAUDE.md")).unwrap(),
+            "hello"
+        );
+        assert_eq!(
+            std::fs::read_to_string(client.join(".claude/settings.json")).unwrap(),
+            "{}"
+        );
     }
 }
