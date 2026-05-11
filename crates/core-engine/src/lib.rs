@@ -5,6 +5,7 @@ pub mod registry;
 pub mod session;
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{anyhow, Context};
@@ -32,11 +33,14 @@ pub struct Engine {
     /// When the cap is hit, new SessionKeys are rejected with a chat reply
     /// — defends against fork-bomb scenarios where many users spawn agents.
     max_sessions: usize,
+    /// When true, buffer all partial text and send a single reply per assistant
+    /// turn. Avoids fragmented messages on chat platforms (LINE, Slack).
+    batch_replies: bool,
 }
 
 impl Engine {
     pub fn builder() -> EngineBuilder {
-        EngineBuilder::default()
+        EngineBuilder::new()
     }
 
     pub fn commands(&self) -> Arc<RwLock<CommandRegistry>> {
@@ -116,6 +120,7 @@ impl Engine {
         let cmd = Cmd::Send {
             prompt,
             attachments,
+            reply_ctx: reply_ctx.clone(),
         };
         match handle.tx.send(cmd).await {
             Ok(()) => Ok(()),
@@ -166,25 +171,17 @@ impl Engine {
                 }
                 self.platform.reply(reply_ctx, &lines.join("\n")).await?;
             }
-            "reset" | "new" => {
+            "new" => {
                 self.reset_session(key).await?;
-                self.platform.reply(reply_ctx, "session reset.").await.ok();
+                self.platform
+                    .reply(reply_ctx, "session reset — next message starts fresh.")
+                    .await
+                    .ok();
             }
             "clear" => {
                 self.clear_session(key).await?;
                 self.platform
                     .reply(reply_ctx, "session cleared — all history wiped.")
-                    .await
-                    .ok();
-            }
-            "agent" => {
-                let target = args
-                    .first()
-                    .copied()
-                    .ok_or_else(|| anyhow!("usage: /agent <name>"))?;
-                self.switch_agent(key, target).await?;
-                self.platform
-                    .reply(reply_ctx, &format!("switched agent → `{target}`"))
                     .await
                     .ok();
             }
@@ -198,110 +195,14 @@ impl Engine {
                 );
                 self.platform.reply(reply_ctx, &body).await?;
             }
-            "yes" | "no" => {
-                let id = args
-                    .first()
-                    .copied()
-                    .ok_or_else(|| anyhow!("usage: /{name} <permission_id>"))?;
-                let allow = name == "yes";
-                if let Some(handle) = self.sessions.get(key) {
-                    handle
-                        .tx
-                        .send(Cmd::Permission {
-                            id: id.to_string(),
-                            allow,
-                        })
-                        .await
-                        .map_err(|_| anyhow!("session actor dropped"))?;
-                } else {
-                    self.platform
-                        .reply(reply_ctx, "no active session for this user")
-                        .await
-                        .ok();
-                }
+            "resume" => {
+                self.handle_resume(args, key, reply_ctx).await?;
             }
-            "model" => {
-                let v = args.first().copied().unwrap_or("");
-                self.apply_override(key, "model", v).await?;
-                self.reset_session(key).await?;
-                self.platform
-                    .reply(
-                        reply_ctx,
-                        &format!("model → `{v}`; new session will start on next message."),
-                    )
-                    .await?;
+            "mcp" => {
+                self.handle_mcp(key, reply_ctx).await?;
             }
-            "dir" => {
-                let v = args
-                    .first()
-                    .copied()
-                    .ok_or_else(|| anyhow!("usage: /dir <path>"))?;
-                self.apply_override(key, "add_dir", v).await?;
-                self.reset_session(key).await?;
-                self.platform
-                    .reply(reply_ctx, &format!("added directory: `{v}`"))
-                    .await?;
-            }
-            "effort" => {
-                let v = args
-                    .first()
-                    .copied()
-                    .ok_or_else(|| anyhow!("usage: /effort <low|medium|high|xhigh|max>"))?;
-                self.apply_override(key, "effort", v).await?;
-                self.reset_session(key).await?;
-                self.platform
-                    .reply(reply_ctx, &format!("effort → `{v}`"))
-                    .await?;
-            }
-            "budget" => {
-                let v = args
-                    .first()
-                    .copied()
-                    .ok_or_else(|| anyhow!("usage: /budget <usd amount>"))?;
-                self.apply_override(key, "budget", v).await?;
-                self.reset_session(key).await?;
-                self.platform
-                    .reply(reply_ctx, &format!("max budget → ${v}"))
-                    .await?;
-            }
-            "tools" => {
-                // /tools allow Bash(git *)
-                // /tools deny  Bash(rm *)
-                // /tools clear
-                let action = args
-                    .first()
-                    .copied()
-                    .ok_or_else(|| anyhow!("usage: /tools allow|deny|clear [tool]"))?;
-                match action {
-                    "allow" => {
-                        let t = args
-                            .get(1)
-                            .copied()
-                            .ok_or_else(|| anyhow!("missing tool"))?;
-                        self.apply_override(key, "allow_tool", t).await?;
-                    }
-                    "deny" => {
-                        let t = args
-                            .get(1)
-                            .copied()
-                            .ok_or_else(|| anyhow!("missing tool"))?;
-                        self.apply_override(key, "deny_tool", t).await?;
-                    }
-                    "clear" => self.apply_override(key, "clear_tools", "").await?,
-                    other => anyhow::bail!("unknown action `{other}`; use allow|deny|clear"),
-                }
-                self.reset_session(key).await?;
-                self.platform.reply(reply_ctx, "tools updated.").await?;
-            }
-            "system" => {
-                // /system <prompt...> — append system prompt
-                let joined = args.join(" ");
-                self.apply_override(key, "append_system_prompt", &joined)
-                    .await?;
-                self.reset_session(key).await?;
-                self.platform
-                    .reply(reply_ctx, "system prompt updated.")
-                    .await?;
+            "skills" => {
+                self.handle_skills(key, reply_ctx).await?;
             }
             other => {
                 self.platform
@@ -309,6 +210,172 @@ impl Engine {
                     .await?;
             }
         }
+        Ok(())
+    }
+
+    async fn handle_resume(
+        &self,
+        args: &[&str],
+        key: &SessionKey,
+        reply_ctx: &ReplyCtx,
+    ) -> Result<()> {
+        let target_id = args.first().copied().unwrap_or("");
+        if target_id.is_empty() {
+            // List sessions for this key.
+            let reg = self.registry.lock().await;
+            let Some(entry) = reg.entries().get(key) else {
+                self.platform.reply(reply_ctx, "no sessions found.").await?;
+                return Ok(());
+            };
+            let mut lines = Vec::new();
+            if let Some(id) = &entry.active_session_id {
+                lines.push(format!("▶ {} (active, agent={})", id, entry.agent));
+            }
+            let past = &entry.past_agent_session_ids;
+            let show = past.len().min(20);
+            for (agent, sid) in past.iter().rev().take(show) {
+                lines.push(format!("  {} (agent={})", sid, agent));
+            }
+            if past.len() > show {
+                lines.push(format!("  … and {} more", past.len() - show));
+            }
+            if lines.is_empty() {
+                self.platform.reply(reply_ctx, "no sessions found.").await?;
+            } else {
+                self.platform.reply(reply_ctx, &lines.join("\n")).await?;
+            }
+        } else {
+            // Resume a specific session id.
+            if let Some((_, h)) = self.sessions.remove(key) {
+                let _ = h.tx.send(Cmd::Close).await;
+            }
+            let agent_name = {
+                let reg = self.registry.lock().await;
+                reg.agent_for(key)
+                    .unwrap_or_else(|| self.default_agent.clone())
+            };
+            {
+                let mut reg = self.registry.lock().await;
+                reg.record_session(key.clone(), agent_name, target_id.to_string());
+                reg.persist().await.ok();
+            }
+            self.platform
+                .reply(
+                    reply_ctx,
+                    &format!("will resume session `{target_id}` on next message."),
+                )
+                .await?;
+        }
+        Ok(())
+    }
+
+    fn agent_client_dir(&self, key: &SessionKey) -> Option<PathBuf> {
+        let agent_name = {
+            // Can't hold the lock across the agent call, but we only need the name.
+            // Use try_lock to avoid deadlock if called from within a locked context.
+            let reg = self.registry.try_lock().ok()?;
+            reg.agent_for(key)
+                .unwrap_or_else(|| self.default_agent.clone())
+        };
+        let agent = self.agents.get(&agent_name)?;
+        agent.client_dir(key)
+    }
+
+    async fn handle_mcp(&self, key: &SessionKey, reply_ctx: &ReplyCtx) -> Result<()> {
+        let Some(dir) = self.agent_client_dir(key) else {
+            self.platform
+                .reply(reply_ctx, "per-client isolation not configured.")
+                .await?;
+            return Ok(());
+        };
+        let mcp_path = dir.join(".mcp.json");
+        if !mcp_path.exists() {
+            self.platform
+                .reply(
+                    reply_ctx,
+                    &format!("no .mcp.json found.\nconfig path: {}", mcp_path.display()),
+                )
+                .await?;
+            return Ok(());
+        }
+        let raw = std::fs::read_to_string(&mcp_path)?;
+        let parsed: serde_json::Value = serde_json::from_str(&raw)?;
+        let mut lines = vec!["MCP servers:".to_string()];
+        if let Some(servers) = parsed.get("mcpServers").and_then(|v| v.as_object()) {
+            for name in servers.keys() {
+                lines.push(format!("  - {name}"));
+            }
+        }
+        if lines.len() == 1 {
+            lines.push("  (none)".to_string());
+        }
+        lines.push(format!("config: {}", mcp_path.display()));
+        self.platform.reply(reply_ctx, &lines.join("\n")).await?;
+        Ok(())
+    }
+
+    async fn handle_skills(&self, key: &SessionKey, reply_ctx: &ReplyCtx) -> Result<()> {
+        let Some(dir) = self.agent_client_dir(key) else {
+            self.platform
+                .reply(reply_ctx, "per-client isolation not configured.")
+                .await?;
+            return Ok(());
+        };
+        let mut lines = Vec::new();
+
+        // Scan .claude/skills/*/SKILL.md
+        let skills_dir = dir.join(".claude").join("skills");
+        if skills_dir.is_dir() {
+            let mut names: Vec<String> = Vec::new();
+            if let Ok(entries) = std::fs::read_dir(&skills_dir) {
+                for entry in entries.flatten() {
+                    if entry.path().is_dir() && entry.path().join("SKILL.md").exists() {
+                        names.push(entry.file_name().to_string_lossy().into_owned());
+                    }
+                }
+            }
+            names.sort();
+            if names.is_empty() {
+                lines.push("Skills: (none)".to_string());
+            } else {
+                lines.push(format!("Skills ({}):", names.len()));
+                for name in &names {
+                    lines.push(format!("  /{name}"));
+                }
+            }
+            lines.push(format!("dir: {}", skills_dir.display()));
+        } else {
+            lines.push("Skills: (none)".to_string());
+            lines.push(format!("dir: {} (not found)", skills_dir.display()));
+        }
+
+        // Also show settings.json summary if present
+        let settings_path = dir.join(".claude").join("settings.json");
+        if settings_path.exists() {
+            if let Ok(raw) = std::fs::read_to_string(&settings_path) {
+                if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&raw) {
+                    lines.push(String::new());
+                    lines.push("Settings:".to_string());
+                    if let Some(obj) = parsed.as_object() {
+                        for (k, v) in obj {
+                            match v {
+                                serde_json::Value::Array(arr) => {
+                                    lines.push(format!("  {k}: [{} items]", arr.len()));
+                                }
+                                serde_json::Value::Object(map) => {
+                                    lines.push(format!("  {k}: {{{} keys}}", map.len()));
+                                }
+                                _ => {
+                                    lines.push(format!("  {k}: {v}"));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        self.platform.reply(reply_ctx, &lines.join("\n")).await?;
         Ok(())
     }
 
@@ -335,7 +402,7 @@ impl Engine {
                 .reply(
                     reply_ctx,
                     "⚠️ bridge is at capacity (too many active sessions). \
-                     Try /reset on an idle conversation or wait a moment.",
+                     Try /new on an idle conversation or wait a moment.",
                 )
                 .await;
             return Err(anyhow!("max_sessions ({}) reached", self.max_sessions));
@@ -368,6 +435,7 @@ impl Engine {
             self.registry.clone(),
             key.clone(),
             agent_name.clone(),
+            self.batch_replies,
         );
 
         {
@@ -406,21 +474,6 @@ impl Engine {
         reg.clear_all(key);
         reg.persist().await.ok();
         Ok(())
-    }
-
-    /// Forward a `(name, value)` override to whichever agent is currently
-    /// active for `key`. Unknown keys / unsupported agents return `Ok(())`
-    /// per the trait default.
-    async fn apply_override(&self, key: &SessionKey, name: &str, value: &str) -> Result<()> {
-        let agent_name = {
-            let reg = self.registry.lock().await;
-            reg.agent_for(key)
-                .unwrap_or_else(|| self.default_agent.clone())
-        };
-        let Some(agent) = self.agents.get(&agent_name) else {
-            return Ok(());
-        };
-        agent.set_override(key, name, value).await
     }
 
     /// Switch the active agent for `key`. Closes any live session and updates
@@ -475,6 +528,17 @@ pub struct EngineBuilder {
     registry: Option<Arc<Mutex<SessionRegistry>>>,
     extra_commands: Vec<CommandSpec>,
     max_sessions: Option<usize>,
+    /// Defaults to true via `Self::default()` override below.
+    batch_replies: bool,
+}
+
+impl EngineBuilder {
+    pub fn new() -> Self {
+        Self {
+            batch_replies: true,
+            ..Default::default()
+        }
+    }
 }
 
 impl EngineBuilder {
@@ -503,6 +567,12 @@ impl EngineBuilder {
     /// chat reply and never spawn a backing agent process. Default 96.
     pub fn max_sessions(mut self, n: usize) -> Self {
         self.max_sessions = Some(n);
+        self
+    }
+    /// Buffer all partial text and send a single reply per assistant turn.
+    /// Default true — avoids fragmented messages on chat platforms.
+    pub fn batch_replies(mut self, b: bool) -> Self {
+        self.batch_replies = b;
         self
     }
     pub fn build(self) -> Result<Arc<Engine>> {
@@ -538,6 +608,7 @@ impl EngineBuilder {
             commands: Arc::new(RwLock::new(commands)),
             boot_time_ms: now_ms(),
             max_sessions: self.max_sessions.unwrap_or(96),
+            batch_replies: self.batch_replies,
         }))
     }
 }
@@ -553,21 +624,18 @@ fn builtin_commands() -> Vec<CommandSpec> {
     }
     vec![
         b("help", "list available commands"),
-        b(
-            "reset",
-            "end current session and start a fresh one on next message",
-        ),
-        b("new", "alias for /reset"),
+        b("new", "start a fresh session on next message"),
         b(
             "clear",
             "wipe all session history and start completely fresh",
         ),
-        b("agent", "switch backing agent: /agent <name>"),
         b("agents", "list registered agents"),
-        b("yes", "approve a pending permission: /yes <id>"),
-        b("no", "deny a pending permission: /no <id>"),
-        b("model", "request model change (requires /reset)"),
-        b("dir", "request cwd change (requires /reset)"),
+        b(
+            "resume",
+            "list sessions or resume one: /resume [session_id]",
+        ),
+        b("mcp", "show MCP servers configured for this client"),
+        b("skills", "show skills/settings configured for this client"),
     ]
 }
 

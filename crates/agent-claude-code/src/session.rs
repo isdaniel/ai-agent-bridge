@@ -258,27 +258,16 @@ impl AgentSession for ClaudeCodeSession {
     }
 }
 
-fn serialize_attachment(att: &Attachment, inline_max: u64) -> Result<serde_json::Value> {
+fn serialize_attachment(att: &Attachment, _inline_max: u64) -> Result<serde_json::Value> {
     match att.kind {
         AttachmentKind::Image => {
-            let size = att.bytes.unwrap_or_else(|| {
-                std::fs::metadata(&att.path)
-                    .map(|m| m.len())
-                    .unwrap_or(u64::MAX)
-            });
-            if size <= inline_max {
-                let bytes = std::fs::read(&att.path)?;
-                let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
-                Ok(json!({
-                    "type": "image",
-                    "source": {"type": "base64", "media_type": att.mime, "data": b64}
-                }))
-            } else {
-                Ok(json!({
-                    "type": "image",
-                    "source": {"type": "file", "path": att.path.to_string_lossy(), "media_type": att.mime}
-                }))
-            }
+            let bytes = std::fs::read(&att.path)
+                .with_context(|| format!("reading image {}", att.path.display()))?;
+            let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+            Ok(json!({
+                "type": "image",
+                "source": {"type": "base64", "media_type": att.mime, "data": b64}
+            }))
         }
         AttachmentKind::File | AttachmentKind::Audio => {
             // Pass as text reference; claude can read the path from disk.
@@ -562,7 +551,7 @@ mod tests {
     }
 
     #[test]
-    fn large_image_uses_path_ref() {
+    fn large_image_still_uses_base64() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("big.png");
         std::fs::write(&path, b"FAKE").unwrap();
@@ -574,7 +563,7 @@ mod tests {
             name: None,
         };
         let v = serialize_attachment(&att, 256 * 1024).unwrap();
-        assert_eq!(v["source"]["type"], "file");
+        assert_eq!(v["source"]["type"], "base64");
     }
 
     #[test]
@@ -635,7 +624,7 @@ mod tests {
 
     #[test]
     fn no_false_positives_on_slash_commands() {
-        let text = "Try /reset or /help for more options.";
+        let text = "Try /new or /help for more options.";
         let paths = find_absolute_paths(text);
         assert!(paths.is_empty());
     }

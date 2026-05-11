@@ -57,7 +57,7 @@ async fn echo_round_trip() {
 }
 
 #[tokio::test]
-async fn reset_clears_active_session() {
+async fn new_clears_active_session() {
     let platform = Arc::new(MockPlatform::new("mock"));
     let engine = Engine::builder()
         .add_agent(Arc::new(EchoAgent))
@@ -67,7 +67,7 @@ async fn reset_clears_active_session() {
         .unwrap();
 
     let h: Arc<dyn MessageHandler> = engine.clone();
-    h.handle(make_msg(SessionKey::new("mock", "u2"), "/reset"))
+    h.handle(make_msg(SessionKey::new("mock", "u2"), "/new"))
         .await;
     drain_until(&platform, |r| {
         r.iter().any(|x| x.text.contains("session reset"))
@@ -98,45 +98,10 @@ async fn help_lists_builtins() {
         .find(|r| r.text.contains("/help"))
         .unwrap()
         .text;
-    assert!(body.contains("/reset"));
-    assert!(body.contains("/agent"));
-    engine.shutdown().await;
-}
-
-#[tokio::test]
-async fn agent_switch_records_in_registry() {
-    let platform = Arc::new(MockPlatform::new("mock"));
-    // Two echo agents under different names.
-    struct EchoNamed(&'static str);
-    #[async_trait::async_trait]
-    impl core_traits::Agent for EchoNamed {
-        fn name(&self) -> &'static str {
-            self.0
-        }
-        async fn start_session(
-            &self,
-            _key: SessionKey,
-            _resume: Option<String>,
-        ) -> core_traits::Result<Box<dyn core_traits::AgentSession>> {
-            test_support::EchoAgent.start_session(_key, _resume).await
-        }
-    }
-
-    let engine = Engine::builder()
-        .add_agent(Arc::new(EchoNamed("echo")))
-        .add_agent(Arc::new(EchoNamed("echo2")))
-        .default_agent("echo")
-        .platform(platform.clone())
-        .build()
-        .unwrap();
-
-    let key = SessionKey::new("mock", "us");
-    let h: Arc<dyn MessageHandler> = engine.clone();
-
-    h.handle(make_msg(key.clone(), "/agent echo2")).await;
-    drain_until(&platform, |r| r.iter().any(|x| x.text.contains("switched"))).await;
-    let replies = platform.replies().await;
-    assert!(replies.iter().any(|r| r.text.contains("→ `echo2`")));
+    assert!(body.contains("/new"));
+    assert!(body.contains("/resume"));
+    assert!(body.contains("/mcp"));
+    assert!(body.contains("/skills"));
     engine.shutdown().await;
 }
 

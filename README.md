@@ -34,12 +34,14 @@ The bridge passes `--dangerously-skip-permissions` to `claude` by default becaus
 | **`--agent shell`** — generic CLI runner for `aichat`, `mods`, custom scripts | `[agents.shell].binary = "..."` |
 | **`--agent http` / `openai`** — escape hatch for OpenAI-compatible APIs | Off by default; needs API key |
 | **`--platform line`** — LINE Webhook + Push API | Inbound text + image/file/audio download |
-| **`--platform slack`** — Slack Socket Mode | Outbound thread-aware reply + `files.uploadV2` |
+| **`--platform slack`** — Slack Socket Mode | Mention-only in channels (`@bot`), always respond in DMs; thread-aware reply + `files.uploadV2` |
 | **`--platform stdio`** — local terminal | Dev / smoke test without bot setup |
 | Per-user / per-channel **session persistence** | Restart-safe via `--resume <id>` |
+| **Per-client config isolation** | Each user gets their own `CLAUDE.md`, `.claude/settings.json`, `.mcp.json` (custom memory, skills, MCP per client) |
 | **Slash commands** | `/help /reset /new /agent /agents /yes /no /model /dir` + user templates |
 | **Live agent switch** via `/agent <name>` | Closes current session, archives id, next message spawns new agent |
-| **Streaming throttle** | Partial chunks coalesced and flushed every 1.2 s / 240 bytes (LINE / Slack rate-limit friendly) |
+| **Streaming throttle** | Partial chunks coalesced and flushed every 1.2 s / 240 bytes (LINE / Slack rate-limit friendly). **Batch mode** (default): all partial text buffered and sent as a single message per assistant turn — avoids fragmented replies on chat platforms. |
+| **Typing indicator** | While the agent is working in batch mode, the platform's typing indicator fires every 15 s (LINE Loading Animation API / Slack typing indicator) — free, no message quota consumed. |
 | **Background daemon** | `fd-lock` single-instance + daily-rotating logs |
 | **OS-native service install** | `aab daemon install` → systemd-user unit at `~/.config/systemd/user/aab.service` |
 
@@ -161,6 +163,8 @@ LINE_CHANNEL_SECRET=xxx LINE_CHANNEL_TOKEN=yyy \
 # 3) Slack Socket Mode (no public IP needed)
 SLACK_APP_TOKEN=xapp-... SLACK_BOT_TOKEN=xoxb-... \
   ./target/release/aab run --agent claude --platform slack
+# In channels: @mention the bot to trigger a response; it ignores un-tagged messages.
+# In DMs: the bot always responds (no @mention needed).
 
 # 4) Inspect / reset persistent sessions
 ./target/release/aab session list
@@ -213,6 +217,19 @@ max_budget_usd = 5.0                  # per-session USD cap
 allowed_tools = ["Read", "Edit", "Bash(git *)", "Bash(npm *)"]
 disallowed_tools = ["Bash(rm *)", "Bash(curl *)"]
 
+# ── Per-client isolation ──
+# When set, each SessionKey (e.g. each LINE user) gets a subdirectory
+# under this path used as cwd for claude. Claude reads CLAUDE.md,
+# .claude/settings.json, .mcp.json from each client's dir — giving
+# isolated memory, skills, and MCP servers per client.
+# Auth stays shared via the host's ~/.claude/ credentials.
+client_config_base_dir = "/home/me/.ai-agent-bridge/clients"
+# Optional: template directory copied into new client workspaces.
+# Put default CLAUDE.md, .claude/settings.json, .mcp.json here.
+client_template_dir = "/home/me/.ai-agent-bridge/client-template"
+# An office-oriented example template is included in the repo:
+#   client_template_dir = "./examples/client-template"
+
 [agents.copilot]
 binary = "gh"
 extra_args = ["copilot", "explain"]   # `explain` produces non-interactive output
@@ -251,6 +268,19 @@ bot_token_env = "SLACK_BOT_TOKEN"            # xoxb-... (chat / files)
 ```
 
 Secrets always come from env vars (`LINE_CHANNEL_*`, `SLACK_*_TOKEN`, optionally `OPENAI_API_KEY`). The TOML only points at which env var to read.
+
+### Slack app setup
+
+Slack uses Socket Mode (WebSocket) — no public URL or tunnel needed.
+
+1. **Create a Slack App**: [api.slack.com/apps](https://api.slack.com/apps) → Create New App → From scratch.
+2. **Enable Socket Mode**: Settings → Socket Mode → Enable. Create an app-level token with `connections:write` scope → copy the `xapp-...` token → `SLACK_APP_TOKEN`.
+3. **Bot Token Scopes**: OAuth & Permissions → Bot Token Scopes → add `chat:write`, `files:read`, `files:write`.
+4. **Event Subscriptions**: Event Subscriptions → Enable → Subscribe to bot events: `message.channels`, `message.groups`, `message.im`.
+5. **Install**: Install App → Install to Workspace → copy the `xoxb-...` Bot User OAuth Token → `SLACK_BOT_TOKEN`.
+6. **Invite**: In Slack, invite the bot to a channel: `/invite @YourBotName`.
+
+The bot only responds when **@mentioned** in channels. In DMs it responds to every message. The `@mention` tag is automatically stripped from the prompt before forwarding to the agent.
 
 ## Slash commands
 
@@ -320,6 +350,7 @@ pub trait Platform: Send + Sync {
     async fn start(&self, handler: Arc<dyn MessageHandler>) -> Result<()>;
     async fn reply(&self, ctx: &ReplyCtx, text: &str) -> Result<()>;
     async fn send_attachment(&self, ctx: &ReplyCtx, att: &Attachment) -> Result<()>;
+    async fn show_typing(&self, ctx: &ReplyCtx) -> Result<()>; // typing indicator (free, no quota)
 }
 ```
 

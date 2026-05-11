@@ -7,6 +7,10 @@
 //! [`FLUSH_THRESHOLD_BYTES`], whichever comes first. A non-partial chunk or
 //! [`Event::Done`] always force-flushes. This keeps chat platforms (LINE rate
 //! limits, Slack flood detection) sane while still feeling streaming-ish.
+//!
+//! When `batch_replies` is true, partial text is never flushed mid-stream.
+//! The actor waits for the complete non-partial text and sends it as a single
+//! message. This avoids fragmented replies on chat platforms.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -21,12 +25,14 @@ use crate::registry::SessionRegistry;
 const INBOX_CAP: usize = 32;
 const FLUSH_INTERVAL: Duration = Duration::from_millis(1200);
 const FLUSH_THRESHOLD_BYTES: usize = 240;
+const THINKING_INTERVAL: Duration = Duration::from_secs(15);
 
 #[derive(Debug)]
 pub enum Cmd {
     Send {
         prompt: String,
         attachments: Vec<Attachment>,
+        reply_ctx: ReplyCtx,
     },
     Permission {
         id: String,
@@ -54,20 +60,21 @@ impl SessionActor {
         registry: Arc<Mutex<SessionRegistry>>,
         key: SessionKey,
         agent_name: String,
+        batch_replies: bool,
     ) -> Self {
         let (tx, mut rx) = mpsc::channel::<Cmd>(INBOX_CAP);
         let mut events = session.events();
         let session_id = session.id();
         tokio::spawn(async move {
-            info!(?key, agent = %agent_name, sid = %session_id, "session actor up");
-            let mut state = StreamState::default();
-            // Pin a flush ticker but only sleep until next deadline.
+            info!(?key, agent = %agent_name, sid = %session_id, batch = batch_replies, "session actor up");
+            let mut state = StreamState::new(batch_replies);
+            let mut reply_ctx = reply_ctx;
             loop {
                 let deadline = state.next_deadline();
                 tokio::select! {
                     cmd = rx.recv() => match cmd {
-                        Some(Cmd::Send { prompt, attachments }) => {
-                            // New user turn — drop any leftover partial buffer.
+                        Some(Cmd::Send { prompt, attachments, reply_ctx: ctx }) => {
+                            reply_ctx = ctx;
                             state.discard_buffer();
                             if let Err(e) = session.send(prompt, attachments).await {
                                 error!(error = %e, "session.send failed");
@@ -95,7 +102,11 @@ impl SessionActor {
                         }
                     },
                     _ = sleep_until(deadline) => {
-                        state.flush(&platform, &reply_ctx).await;
+                        if state.batch && state.processing {
+                            state.send_thinking(&platform, &reply_ctx).await;
+                        } else {
+                            state.flush(&platform, &reply_ctx).await;
+                        }
                     }
                 }
             }
@@ -122,11 +133,52 @@ struct StreamState {
     buf: String,
     /// When buf became non-empty; flush at this + FLUSH_INTERVAL.
     buffering_since: Option<Instant>,
+    /// When true, never flush partials; wait for non-partial or Done.
+    batch: bool,
+    /// True while receiving events but haven't sent the final reply yet.
+    processing: bool,
+    /// Last time we sent a thinking indicator.
+    last_thinking: Option<Instant>,
+    /// Counter for cycling through thinking messages.
+    thinking_count: usize,
 }
 
 impl StreamState {
+    fn new(batch: bool) -> Self {
+        Self {
+            batch,
+            ..Default::default()
+        }
+    }
+
     fn next_deadline(&self) -> Option<Instant> {
+        if self.batch {
+            if self.processing {
+                let base = self.last_thinking.unwrap_or_else(Instant::now);
+                return Some(base + THINKING_INTERVAL);
+            }
+            return None;
+        }
         self.buffering_since.map(|t| t + FLUSH_INTERVAL)
+    }
+
+    fn mark_processing(&mut self) {
+        if !self.processing {
+            self.processing = true;
+            self.last_thinking = Some(Instant::now());
+        }
+    }
+
+    fn clear_processing(&mut self) {
+        self.processing = false;
+        self.last_thinking = None;
+        self.thinking_count = 0;
+    }
+
+    async fn send_thinking(&mut self, platform: &Arc<dyn Platform>, reply_ctx: &ReplyCtx) {
+        self.thinking_count += 1;
+        self.last_thinking = Some(Instant::now());
+        let _ = platform.show_typing(reply_ctx).await;
     }
 
     fn append_partial(&mut self, text: &str) {
@@ -140,7 +192,7 @@ impl StreamState {
     }
 
     fn should_flush(&self) -> bool {
-        self.buf.len() >= FLUSH_THRESHOLD_BYTES
+        !self.batch && self.buf.len() >= FLUSH_THRESHOLD_BYTES
     }
 
     fn discard_buffer(&mut self) {
@@ -149,6 +201,7 @@ impl StreamState {
     }
 
     async fn flush(&mut self, platform: &Arc<dyn Platform>, reply_ctx: &ReplyCtx) {
+        self.clear_processing();
         if self.buf.trim().is_empty() {
             self.discard_buffer();
             return;
@@ -171,6 +224,7 @@ async fn handle_event(
 ) {
     match event {
         Event::AssistantText { text, partial } => {
+            state.mark_processing();
             if partial {
                 state.append_partial(&text);
                 if state.should_flush() {
@@ -180,6 +234,7 @@ async fn handle_event(
                 // Non-partial = end-of-turn snapshot. If we already streamed
                 // partial chunks, the buffer holds the tail; flush whichever
                 // representation is more complete.
+                state.clear_processing();
                 if !state.buf.is_empty() && text.starts_with(&state.buf) {
                     // Streaming caught up — drop buffer and send the full text
                     // (single message in chat, not duplicated).
@@ -212,6 +267,7 @@ async fn handle_event(
             let _ = platform.reply(reply_ctx, &body).await;
         }
         Event::ToolStart { name, .. } => {
+            state.mark_processing();
             debug!("tool start: {name}");
         }
         Event::ToolEnd { id, ok } => {

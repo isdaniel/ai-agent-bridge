@@ -36,6 +36,7 @@ pub struct SlackConfig {
 pub struct SlackPlatform {
     cfg: SlackConfig,
     http: reqwest::Client,
+    bot_user_id: tokio::sync::OnceCell<String>,
 }
 
 impl SlackPlatform {
@@ -43,7 +44,35 @@ impl SlackPlatform {
         Self {
             cfg,
             http: reqwest::Client::new(),
+            bot_user_id: tokio::sync::OnceCell::new(),
         }
+    }
+
+    async fn resolve_bot_user_id(&self) -> Result<&str> {
+        self.bot_user_id
+            .get_or_try_init(|| async {
+                #[derive(Deserialize)]
+                struct Resp {
+                    ok: bool,
+                    user_id: Option<String>,
+                    error: Option<String>,
+                }
+                let r: Resp = self
+                    .http
+                    .post("https://slack.com/api/auth.test")
+                    .bearer_auth(&self.cfg.bot_token)
+                    .send()
+                    .await?
+                    .json()
+                    .await?;
+                if !r.ok {
+                    anyhow::bail!("auth.test failed: {}", r.error.unwrap_or_default());
+                }
+                r.user_id
+                    .ok_or_else(|| anyhow::anyhow!("auth.test returned no user_id"))
+            })
+            .await
+            .map(|s| s.as_str())
     }
 
     async fn open_socket_url(&self) -> Result<String> {
@@ -123,6 +152,28 @@ impl SlackPlatform {
             None => return,
         };
         let user = ev.user.clone().unwrap_or_default();
+
+        // In channels (C/G), only respond when @mentioned. DMs (D) always respond.
+        let is_dm = channel.starts_with('D');
+        let mut text = ev.text.clone();
+        if !is_dm {
+            let bot_id = match self.resolve_bot_user_id().await {
+                Ok(id) => id,
+                Err(e) => {
+                    warn!(error=%e, "could not resolve bot user id");
+                    return;
+                }
+            };
+            let mention_tag = format!("<@{bot_id}>");
+            if !text.contains(&mention_tag) {
+                return;
+            }
+            text = text.replace(&mention_tag, "").trim().to_string();
+            if text.is_empty() {
+                return;
+            }
+        }
+
         let scoped = format!("{channel}/{user}");
         let key = SessionKey::new("slack", scoped);
 
@@ -144,7 +195,7 @@ impl SlackPlatform {
 
         let msg = Message {
             key,
-            text: ev.text,
+            text,
             attachments,
             reply_ctx: ReplyCtx {
                 channel: Some(channel),
@@ -216,6 +267,10 @@ impl Platform for SlackPlatform {
     }
 
     async fn start(&self, handler: Arc<dyn MessageHandler>) -> Result<()> {
+        match self.resolve_bot_user_id().await {
+            Ok(id) => info!(bot_user_id=%id, "slack bot identity resolved; mention-only in channels"),
+            Err(e) => warn!(error=%e, "could not resolve bot user id; will retry on first message"),
+        }
         let mut backoff = Duration::from_secs(1);
         loop {
             match self.run_once(handler.clone()).await {

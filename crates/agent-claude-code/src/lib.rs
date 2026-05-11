@@ -218,11 +218,17 @@ impl Agent for ClaudeCodeAgent {
         }
         Ok(())
     }
+
+    fn client_dir(&self, key: &SessionKey) -> Option<PathBuf> {
+        let cfg = self.cfg.try_read().ok()?;
+        let base = cfg.client_config_base_dir.as_ref()?;
+        Some(base.join(session_key_to_dirname(key)))
+    }
 }
 
 /// Convert a `SessionKey` into a filesystem-safe directory name.
 /// `"line:U1234"` → `"line__U1234"`, `"slack:C1/U2"` → `"slack__C1__U2"`.
-fn session_key_to_dirname(key: &SessionKey) -> String {
+pub fn session_key_to_dirname(key: &SessionKey) -> String {
     key.0
         .replace([':', '/'], "__")
         .chars()

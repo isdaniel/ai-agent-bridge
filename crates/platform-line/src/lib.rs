@@ -18,7 +18,7 @@ use async_trait::async_trait;
 use core_traits::{Attachment, AttachmentKind, MessageHandler, Platform, ReplyCtx, Result};
 use media_publisher::MediaPublisher;
 use tokio::sync::Mutex;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 pub use sign::verify_signature;
 
@@ -148,6 +148,30 @@ impl Platform for LinePlatform {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
             anyhow::bail!("LINE push (attachment) failed: {status} {body}");
+        }
+        Ok(())
+    }
+
+    async fn show_typing(&self, ctx: &ReplyCtx) -> Result<()> {
+        let chat_id = ctx
+            .user
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("LINE show_typing requires user id"))?;
+        let body = serde_json::json!({
+            "chatId": chat_id,
+            "loadingSeconds": 20
+        });
+        let resp = self
+            .http
+            .post("https://api.line.me/v2/bot/chat/loading")
+            .bearer_auth(&self.cfg.channel_token)
+            .json(&body)
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            debug!("LINE loading animation failed: {status} {text}");
         }
         Ok(())
     }

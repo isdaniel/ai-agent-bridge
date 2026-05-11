@@ -111,8 +111,17 @@ and there's nowhere to accidentally introduce a cycle.
 - **Streaming throttle in the actor.** `Event::AssistantText { partial: true }`
   chunks are accumulated in a `String` buffer and flushed every 1.2 s OR
   240 bytes, whichever fires first. Non-partial frames + `Event::Done` always
-  force-flush. Keeps LINE / Slack rate-limits happy without losing the
-  "streaming feel".
+  force-flush. **Batch mode** (default, `batch_replies=true`): partial text is
+  never flushed mid-stream — the actor waits for the complete non-partial text
+  and sends it as a single message per turn. While processing in batch mode,
+  `Platform::show_typing()` fires every 15 s to show the user the bot is still
+  working (LINE Loading Animation API / Slack typing indicator — free, no
+  message quota consumed). Keeps LINE / Slack rate-limits happy without losing
+  the "streaming feel".
+- **Reply context updates per message.** `Cmd::Send` carries a fresh `ReplyCtx`
+  per user turn. The session actor updates its reply target on each new message,
+  so Slack replies always land in the thread where the user asked — not the
+  thread where the session was first created.
 - **Persistence stores metadata only.** `state.json` records
   `SessionKey → {agent, active_session_id, past_agent_session_ids}`. Live
   agent processes are never serialised — on the next inbound message after a
@@ -148,7 +157,7 @@ pub enum Event {
 
 #[async_trait] pub trait Agent        { fn name(); async fn start_session(); }
 #[async_trait] pub trait AgentSession { fn id(); async fn send(); fn events(); async fn answer_permission(); async fn close(); }
-#[async_trait] pub trait Platform     { fn name(); async fn start(); async fn reply(); async fn send_attachment(); }
+#[async_trait] pub trait Platform     { fn name(); async fn start(); async fn reply(); async fn send_attachment(); async fn show_typing(); }
 #[async_trait] pub trait MessageHandler { async fn handle(Message); }
 ```
 
@@ -162,18 +171,22 @@ spawn ─► info!("session actor up")
          ▼
          loop {
            select! {
-             Cmd::Send         → state.discard_buffer(); session.send(prompt, atts)
-             Cmd::Permission   → session.answer_permission(id, allow)
-             Cmd::Close | None → state.flush(); break
-             Event from agent  →
+             Cmd::Send{reply_ctx} → update reply_ctx; state.discard_buffer();
+                                    session.send(prompt, atts)
+             Cmd::Permission      → session.answer_permission(id, allow)
+             Cmd::Close | None    → state.flush(); break
+             Event from agent     →
                 AssistantText{partial:true}  → state.append; flush if ≥240B
+                                               (streaming mode only)
                 AssistantText{partial:false} → flush, then send full text
                 AssistantAttachment          → flush, then platform.send_attachment
                 PermissionRequest            → flush, then formatted prompt to platform
                 Error                        → flush, then "⚠️ msg"
                 Done{session_id}             → flush, registry.record_session, persist
                 ToolStart/End                → log only
-             sleep_until(deadline)           → flush
+             sleep_until(deadline)           →
+                batch mode + processing: platform.show_typing() every 15s
+                streaming mode: flush partial buffer
            }
          }
          session.close().await
@@ -285,14 +298,40 @@ stdout NDJSON lines → StreamEvent enum (#[serde(tag="type")])
 
 stdin  user turn → {"type":"user","message":{"role":"user","content":[
                        {"type":"text","text": ...},
-                       {"type":"image","source":{"type":"base64"|"file", ...}}
+                       {"type":"image","source":{"type":"base64","media_type":"...","data":"..."}}
                    ]}}
 
-       inline image if size < 256 KiB; else `{"type":"image","source":{"type":"file","path":...}}`
+       Images are always base64-encoded inline regardless of size.
 
 close  send {"type":"control_request","request":{"subtype":"interrupt"}}
        wait 120 s for child.wait(); else child.start_kill()
 ```
+
+#### Per-client config isolation
+
+When `ClaudeCodeConfig::client_config_base_dir` is set, `start_session`
+derives a per-`SessionKey` subdirectory and overrides `cwd` before spawning:
+
+```text
+SessionKey("line:U1234")
+  → dirname "line__U1234"
+  → cwd = {client_config_base_dir}/line__U1234/
+
+If the directory doesn't exist:
+  1. Copy client_template_dir/ recursively (if set)
+  2. Otherwise create an empty .claude/ subdirectory
+
+The spawned claude sees:
+  CLAUDE.md             ← per-client instructions / static memory
+  .claude/settings.json ← per-client skills & project settings
+  .mcp.json             ← per-client MCP servers
+  auto-memory           ← stored under ~/.claude/projects/<hash>/memory/
+                          (hash derived from cwd, so per-client)
+  auth                  ← shared from ~/.claude/ (unchanged)
+```
+
+Note: when `client_config_base_dir` is set, any explicit `cwd` value
+in the config is silently overridden.
 
 ### `agent-cli` (`crates/agent-cli/src/lib.rs`)
 
@@ -383,6 +422,11 @@ outbound text:
     body: { to: user, messages: [{type:"text", text}] }
   Always Push API — reply tokens expire ~1 min, too short for AI latency.
 
+outbound typing indicator:
+  POST https://api.line.me/v2/bot/chat/loading
+    body: { chatId: user, loadingSeconds: 20 }
+  Free — does not consume monthly push message quota.
+
 outbound attachment:
   via injected MediaPublisher → public HTTPS URL
   then push { type:"image", originalContentUrl: url, previewImageUrl: url }
@@ -392,6 +436,10 @@ outbound attachment:
 ### `platform-slack` (`crates/platform-slack/src/{lib,envelope,upload}.rs`)
 
 ```text
+startup:
+  POST /api/auth.test → { user_id: BOT_USER_ID }
+  (cached in OnceCell; used for mention-only filtering)
+
 connect:
   POST /api/apps.connections.open  Authorization: Bearer {app_token}
   → { url: wss-primary.slack.com/... }
@@ -401,6 +449,10 @@ per envelope:
   ack { envelope_id }
   if type == "events_api" and event.type == "message":
     skip if bot_id is set OR subtype not in {None, "file_share"}
+    mention filter:
+      - DMs (channel starts with 'D'): always respond
+      - channels (C/G): only if text contains <@BOT_USER_ID>;
+        strip mention tag before forwarding
     download files via url_private_download (Authorization: Bearer {bot_token})
     SessionKey = "slack:{channel}/{user}"
     ReplyCtx { channel, thread: thread_ts.or(ts), user }
@@ -474,6 +526,7 @@ Run all: `cargo test --workspace`. Run with logs: `AAB_LOG=debug cargo test ...`
 | P4 | core-commands + built-in slash + `/agent` switch | ✅ done |
 | P5 | SessionRegistry persistence + daemon lock + log rotation + service install/start/stop | ✅ done |
 | P6 | agent-acp (full handshake), agent-http (SSE streaming), Copilot via GitHub Models | ✅ done |
+| P7 | Per-client config isolation: per-SessionKey CWD with own CLAUDE.md, .claude/settings.json, .mcp.json | ✅ done |
 
 ## Known follow-ups (not in scope of P1–P6)
 

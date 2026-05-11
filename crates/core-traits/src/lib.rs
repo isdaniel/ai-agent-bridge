@@ -122,6 +122,13 @@ pub trait Agent: Send + Sync {
     async fn set_override(&self, _key: &SessionKey, _name: &str, _value: &str) -> Result<()> {
         Ok(())
     }
+
+    /// Return the per-client workspace directory for `key`, if per-client
+    /// isolation is configured. Used by `/mcp` and `/skills` builtins to
+    /// read client-specific config files.
+    fn client_dir(&self, _key: &SessionKey) -> Option<PathBuf> {
+        None
+    }
 }
 
 /// One live conversation with a backing agent.
@@ -156,6 +163,13 @@ pub trait Platform: Send + Sync {
     async fn reply(&self, ctx: &ReplyCtx, text: &str) -> Result<()>;
 
     async fn send_attachment(&self, ctx: &ReplyCtx, attachment: &Attachment) -> Result<()>;
+
+    /// Show a typing/loading indicator. Platforms that support it (LINE loading
+    /// animation, Slack typing indicator) implement this; others are no-ops.
+    /// Does NOT consume message quota.
+    async fn show_typing(&self, _ctx: &ReplyCtx) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// Inbound dispatch from a [`Platform`] into the engine.

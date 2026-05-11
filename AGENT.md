@@ -39,6 +39,12 @@ crates/
 │   ├── session.rs       SessionActor — one tokio task per SessionKey,
 │   │                    select! over inbox + agent events, partial-chunk
 │   │                    buffer with 1.2 s / 240 byte flush.
+│   │                    Batch mode (default): buffers all partial text,
+│   │                    sends single message per turn. Fires
+│   │                    Platform::show_typing() every 15 s while
+│   │                    processing (free, no message quota).
+│   │                    reply_ctx updates per-message so thread-aware
+│   │                    replies track the latest conversation thread.
 │   ├── registry.rs      SessionRegistry — atomic JSON persistence at
 │   │                    state.json (schema_version=1). Maps SessionKey
 │   │                    to {agent, active_session_id, past_history}.
@@ -100,7 +106,10 @@ crates/
 │   ├── lib.rs           apps.connections.open → tokio_tungstenite WS.
 │   │                    Auto-reconnect with exponential backoff (1→60s).
 │   │                    chat.postMessage thread-aware; envelope ack
-│   │                    within 3 s.
+│   │                    within 3 s. Mention-only in channels: resolves
+│   │                    bot user ID via auth.test, ignores messages
+│   │                    without @mention, strips mention tag before
+│   │                    forwarding. DMs always respond.
 │   ├── envelope.rs      Envelope + EventsApiPayload + MessageEvent +
 │   │                    SlackFile parsing. is_skippable() for
 │   │                    bot/edit/join filtering.
@@ -153,16 +162,19 @@ crates/
 | Where | What | Why |
 |---|---|---|
 | `core-traits::Agent::set_override` | Trait method with default `Ok(())` | Lets builtin slash commands (`/model` etc) reconfigure agents without polluting `start_session` signature. Only `agent-claude-code` actually implements it. |
-| `SessionActor` (`core-engine/session.rs`) | Buffers `partial:true` text chunks; flushes every 1.2 s OR 240 bytes; force-flushes on `partial:false` / `Done` / `PermissionRequest` / `AssistantAttachment` / `Error`. | LINE / Slack rate-limit + UX. Without throttle, streaming agents flood the chat. |
+| `SessionActor` (`core-engine/session.rs`) | Buffers `partial:true` text chunks; flushes every 1.2 s OR 240 bytes; force-flushes on `partial:false` / `Done` / `PermissionRequest` / `AssistantAttachment` / `Error`. **Batch mode** (default `batch_replies=true`): never flushes partials — waits for non-partial/Done and sends a single message per turn. Fires `Platform::show_typing()` every 15 s while processing. | LINE / Slack rate-limit + UX. Without throttle, streaming agents flood the chat. Batch mode prevents fragmented replies. Typing indicator uses free platform APIs (LINE Loading Animation / Slack typing) to avoid consuming message quota. |
+| `SessionActor` reply_ctx | `Cmd::Send` carries a fresh `ReplyCtx` per message; the actor updates its reply target on each user turn. | Slack thread-aware replies: bot replies in the thread where the user asked, not the thread where the session was first created. |
+| `SlackPlatform` mention filter | In channels (C/G prefix), only responds when `<@BOT_USER_ID>` appears in the message text; strips the mention tag before forwarding. DMs (D prefix) always respond. Bot user ID resolved once via `auth.test` on startup. | Prevents the bot from responding to every message in busy channels. |
 | `SessionRegistry` | Stores **metadata only**. Live agent processes are NEVER serialised. | Process state isn't portable. Next inbound message after restart spawns fresh agent with `--resume <id>` (Claude) or `session/load` (ACP). |
 | `state.json` | Has `schema_version: 1`. Mismatched version → rename to `.json.bak`, start fresh. | Forward upgrade safety. Bump the const + add migration if you change the shape. |
 | `agent-claude-code::session::spawn` | Mints `--session-id <uuid>` for fresh sessions, `--resume <id>` for resumes. | We must know the session id immediately (for the registry) without waiting for the first system event. |
-| `Attachment` for Claude inbound | inline base64 if `< 256 KiB` else passes file path. | Avoid bloating NDJSON stream for large images; Claude can read paths via Read tool. |
+| `Attachment` for Claude inbound | Always base64-encoded inline in the NDJSON stream. | The `"type":"file"` source format is not supported by the Anthropic API; base64 is the universal format. |
 | `LinePlatform::reply` | Always Push API (`/v2/bot/message/push`), never Reply Token API. | LINE reply tokens expire in ~1 minute; AI latency exceeds that. |
 | `LinePlatform::send_attachment` | Requires injected `MediaPublisher`. | LINE Messaging API only accepts public HTTPS URLs, not binary upload. |
 | `SlackPlatform::run_once` | Always ack the envelope within 3 s of receipt. | Slack disconnects sockets that don't ack. |
 | `daemon::LockGuard` | `Box::leak`s the inner `RwLock`. | `fd_lock`'s write-guard borrows from the lock; leaking lets us hold for process lifetime with `'static`. |
 | `claude --dangerously-skip-permissions` | Default on (`ClaudeCodeConfig::skip_permissions = true`). | Bridge has no human at the keyboard. Operators wanting interactive permission flow set it false and route via `/yes <id>` / `/no <id>` chat replies. |
+| `ClaudeCodeConfig::client_config_base_dir` | When set, each `SessionKey` gets its own subdirectory used as `cwd`. | Per-client isolation: Claude reads project-level `CLAUDE.md`, `.claude/settings.json`, `.mcp.json` from each client's dir, giving isolated memory / skills / MCP while sharing the host's auth. `cwd` is overridden when this is set. |
 
 ## 5. How to run / verify locally
 
@@ -267,6 +279,14 @@ CI runs all three on every PR (Linux only). Don't merge red.
 - **`figment` env separator is `__` (double underscore).** Single
   underscore stays inside one section. So `AAB_BRIDGE__DEFAULT_AGENT` not
   `AAB_BRIDGE_DEFAULT_AGENT`.
+- **`cwd` is overridden when `client_config_base_dir` is set.** The
+  per-client isolation feature derives a per-`SessionKey` subdirectory
+  and sets it as `cwd`, so any explicit `cwd` value in config is
+  silently ignored.
+- **Example template**: `examples/client-template/` ships an office-assistant
+  template with skills for Excel/Word generation, CSV analysis, translation,
+  and web research (via MCP fetch server). Point `client_template_dir` at it
+  for a ready-to-use setup.
 
 ## 9. What lives outside the codebase
 
@@ -300,6 +320,9 @@ CI runs all three on every PR (Linux only). Don't merge red.
 | LINE 401 on push | token wrong, or signature failed — check `platform-line/src/sign.rs` |
 | LINE webhook silent | (a) `Use webhook` toggle off (b) `Auto-reply` interferes (c) tunnel URL changed |
 | Slack bot loops | `MessageEvent::is_skippable` not catching the bot id — print `subtype` |
+| Slack bot responds to every message | `resolve_bot_user_id` failed — check `auth.test` response and `SLACK_APP_TOKEN` / `SLACK_BOT_TOKEN` |
+| Slack replies in wrong thread | Check that `Cmd::Send` carries fresh `reply_ctx` — see `session.rs` |
+| LINE 429 monthly limit | Push message quota exhausted; `show_typing()` uses free Loading Animation API and should not contribute. Wait for monthly reset or upgrade plan. |
 | `another instance holds the daemon lock` | leftover `aab` process or stale lock; `pkill aab` then retry |
 | `state.json` schema bumped | check version constant in `core-engine/src/registry.rs::SCHEMA_VERSION` |
 

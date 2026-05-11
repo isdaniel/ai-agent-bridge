@@ -22,6 +22,17 @@ use tracing::info;
 
 use config::AppConfig;
 
+fn expand_tilde(p: PathBuf) -> PathBuf {
+    if let Some(s) = p.to_str() {
+        if let Some(rest) = s.strip_prefix("~/") {
+            if let Some(home) = std::env::var_os("HOME") {
+                return PathBuf::from(home).join(rest);
+            }
+        }
+    }
+    p
+}
+
 #[derive(Parser, Debug)]
 #[command(name = "aab", version, about = "AI Agent Bridge for chat platforms")]
 struct Cli {
@@ -173,7 +184,7 @@ fn build_agent(name: &str, cfg: &AppConfig) -> Result<Arc<dyn Agent>> {
             let cc = ClaudeCodeConfig {
                 binary: a.binary.unwrap_or_else(|| "claude".into()),
                 extra_args: a.extra_args.unwrap_or_default(),
-                cwd: a.cwd,
+                cwd: a.cwd.map(expand_tilde),
                 permission_mode: match a.permission_mode.as_deref() {
                     Some("acceptEdits") => PermissionMode::AcceptEdits,
                     Some("bypassPermissions") => PermissionMode::BypassPermissions,
@@ -192,8 +203,8 @@ fn build_agent(name: &str, cfg: &AppConfig) -> Result<Arc<dyn Agent>> {
                 mcp_config_files: a.mcp_config_files.unwrap_or_default(),
                 session_id: None,
                 inline_image_max_bytes: 256 * 1024,
-                client_config_base_dir: a.client_config_base_dir,
-                client_template_dir: a.client_template_dir,
+                client_config_base_dir: a.client_config_base_dir.map(expand_tilde),
+                client_template_dir: a.client_template_dir.map(expand_tilde),
             };
             Ok(Arc::new(ClaudeCodeAgent::new(cc)))
         }
