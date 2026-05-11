@@ -135,6 +135,7 @@ pub struct ClaudeCodeAgent {
 
 impl ClaudeCodeAgent {
     pub fn new(cfg: ClaudeCodeConfig) -> Self {
+        sync_all_client_dirs(&cfg);
         Self {
             cfg: Arc::new(tokio::sync::RwLock::new(cfg)),
         }
@@ -236,20 +237,49 @@ pub fn session_key_to_dirname(key: &SessionKey) -> String {
         .collect()
 }
 
-/// Create the per-client workspace directory if it doesn't exist.
-/// If a template directory is provided and the client dir is new, its
-/// contents are copied recursively.
-fn ensure_client_dir(dir: &Path, template: Option<&Path>) -> Result<()> {
-    if dir.exists() {
-        return Ok(());
+/// Overlay the template directory onto all existing session directories
+/// under `client_config_base_dir`. Called once at startup so that updated
+/// skills, prompts, and config are propagated to every session.
+fn sync_all_client_dirs(cfg: &ClaudeCodeConfig) {
+    let (Some(base), Some(tmpl)) = (&cfg.client_config_base_dir, &cfg.client_template_dir) else {
+        return;
+    };
+    if !base.is_dir() || !tmpl.is_dir() {
+        return;
     }
+    let Ok(entries) = std::fs::read_dir(base) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !name.starts_with("slack__") && !name.starts_with("line__") {
+            continue;
+        }
+        if let Err(e) = copy_dir_recursive(tmpl, &path) {
+            tracing::warn!(dir = %path.display(), err = %e, "template sync failed");
+        }
+    }
+    info!(base = %base.display(), template = %tmpl.display(), "synced template to all session dirs");
+}
+
+/// Create the per-client workspace directory if it doesn't exist, or overlay
+/// the template if it does. This ensures each session always has the latest
+/// skills and prompts from the template.
+fn ensure_client_dir(dir: &Path, template: Option<&Path>) -> Result<()> {
     if let Some(tmpl) = template {
         if tmpl.is_dir() {
             copy_dir_recursive(tmpl, dir)?;
             return Ok(());
         }
     }
-    std::fs::create_dir_all(dir.join(".claude"))?;
+    if !dir.exists() {
+        std::fs::create_dir_all(dir.join(".claude"))?;
+    }
     Ok(())
 }
 
@@ -310,7 +340,7 @@ mod tests {
     }
 
     #[test]
-    fn ensure_client_dir_noop_if_exists() {
+    fn ensure_client_dir_preserves_existing_without_template() {
         let tmp = tempfile::tempdir().unwrap();
         let client = tmp.path().join("existing");
         std::fs::create_dir_all(&client).unwrap();
@@ -337,6 +367,31 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(client.join(".claude/settings.json")).unwrap(),
             "{}"
+        );
+    }
+
+    #[test]
+    fn ensure_client_dir_overlays_template_on_existing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tmpl = tmp.path().join("template");
+        std::fs::create_dir_all(tmpl.join(".claude")).unwrap();
+        std::fs::write(tmpl.join("CLAUDE.md"), b"updated").unwrap();
+
+        let client = tmp.path().join("line__U999");
+        std::fs::create_dir_all(client.join(".claude")).unwrap();
+        std::fs::write(client.join("CLAUDE.md"), b"old").unwrap();
+        std::fs::write(client.join("user_file.txt"), b"keep").unwrap();
+
+        ensure_client_dir(&client, Some(&tmpl)).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(client.join("CLAUDE.md")).unwrap(),
+            "updated"
+        );
+        // User files not in template are preserved
+        assert_eq!(
+            std::fs::read_to_string(client.join("user_file.txt")).unwrap(),
+            "keep"
         );
     }
 

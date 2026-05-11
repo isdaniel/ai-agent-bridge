@@ -9,6 +9,7 @@ Respond in the same language the user writes in.
 - **Data analysis**: Analyze CSV/Excel data — summaries, pivots, charts
 - **Translation**: Translate text and documents between languages
 - **Web research**: Fetch and summarize web pages using MCP tools
+- **Voice calls**: Make outbound phone calls and play TTS messages to recipients
 
 ## File delivery
 

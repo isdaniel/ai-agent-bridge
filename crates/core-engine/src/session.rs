@@ -25,7 +25,7 @@ use crate::registry::SessionRegistry;
 const INBOX_CAP: usize = 32;
 const FLUSH_INTERVAL: Duration = Duration::from_millis(1200);
 const FLUSH_THRESHOLD_BYTES: usize = 240;
-const THINKING_INTERVAL: Duration = Duration::from_secs(10);
+const THINKING_INTERVAL: Duration = Duration::from_secs(3);
 
 #[derive(Debug)]
 pub enum Cmd {
