@@ -59,3 +59,49 @@ impl Platform for StdioPlatform {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn platform_name() {
+        let p = StdioPlatform::new();
+        assert_eq!(p.name(), "stdio");
+    }
+
+    #[test]
+    fn default_user_is_local() {
+        let p = StdioPlatform::new();
+        assert_eq!(p.user, "local");
+    }
+
+    #[test]
+    fn default_trait_impl() {
+        let p = StdioPlatform::default();
+        assert_eq!(p.user, "local");
+    }
+
+    #[tokio::test]
+    async fn reply_succeeds() {
+        let p = StdioPlatform::new();
+        let ctx = ReplyCtx::default();
+        let result = p.reply(&ctx, "hello");
+        assert!(result.await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn send_attachment_succeeds() {
+        let p = StdioPlatform::new();
+        let att = Attachment {
+            kind: core_traits::AttachmentKind::File,
+            path: "/tmp/test.txt".into(),
+            mime: "text/plain".into(),
+            bytes: Some(5),
+            name: Some("test.txt".into()),
+        };
+        let ctx = ReplyCtx::default();
+        let result = p.send_attachment(&ctx, &att);
+        assert!(result.await.is_ok());
+    }
+}

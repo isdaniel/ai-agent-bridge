@@ -3,9 +3,10 @@
 
 use std::sync::Arc;
 
-use core_engine::Engine;
+use core_engine::{Engine, Scheduler, SessionRegistry};
 use core_traits::{Message, MessageHandler, ReplyCtx, SessionKey};
 use test_support::{EchoAgent, MockPlatform};
+use tokio::sync::Mutex;
 
 fn make_msg(key: SessionKey, text: &str) -> Message {
     Message {
@@ -202,6 +203,176 @@ async fn max_sessions_rejects_overflow() {
     drain_until(&platform, |r| r.iter().any(|x| x.text == "echo: again")).await;
     let replies = platform.replies().await;
     assert!(replies.iter().any(|r| r.text == "echo: again"));
+
+    engine.shutdown().await;
+}
+
+// ── Schedule integration tests ──────────────────────────────────────────
+
+fn make_engine_with_scheduler(platform: Arc<MockPlatform>) -> (Arc<Engine>, Arc<Scheduler>) {
+    let registry = Arc::new(Mutex::new(SessionRegistry::in_memory()));
+    let engine = Engine::builder()
+        .add_agent(Arc::new(EchoAgent))
+        .default_agent("echo")
+        .platform(platform)
+        .registry(registry.clone())
+        .build()
+        .unwrap();
+    let sched = Scheduler::spawn(engine.clone(), registry);
+    engine.set_scheduler(sched.clone());
+    (engine, sched)
+}
+
+#[tokio::test]
+async fn schedule_creates_and_lists() {
+    let platform = Arc::new(MockPlatform::new("mock"));
+    let (engine, _sched) = make_engine_with_scheduler(platform.clone());
+    let h: Arc<dyn MessageHandler> = engine.clone();
+
+    h.handle(make_msg(
+        SessionKey::new("mock", "u-sched"),
+        "/schedule in 1h \"test prompt\"",
+    ))
+    .await;
+    drain_until(&platform, |r| {
+        r.iter().any(|x| x.text.contains("scheduled"))
+    })
+    .await;
+    let replies = platform.replies().await;
+    assert!(
+        replies.iter().any(|r| r.text.contains("scheduled (id=")),
+        "expected schedule confirmation"
+    );
+
+    // Now list schedules
+    h.handle(make_msg(
+        SessionKey::new("mock", "u-sched"),
+        "/schedule-list",
+    ))
+    .await;
+    drain_until(&platform, |r| {
+        r.iter().any(|x| x.text.contains("Scheduled actions"))
+    })
+    .await;
+    let replies = platform.replies().await;
+    assert!(replies.iter().any(|r| r.text.contains("test prompt")));
+
+    engine.shutdown().await;
+}
+
+#[tokio::test]
+async fn schedule_delete_removes_entry() {
+    let platform = Arc::new(MockPlatform::new("mock"));
+    let (engine, sched) = make_engine_with_scheduler(platform.clone());
+    let h: Arc<dyn MessageHandler> = engine.clone();
+    let key = SessionKey::new("mock", "u-del");
+
+    // Create a schedule
+    h.handle(make_msg(key.clone(), "/schedule every 1h \"ping\""))
+        .await;
+    drain_until(&platform, |r| {
+        r.iter().any(|x| x.text.contains("scheduled"))
+    })
+    .await;
+
+    // Get the ID from the confirmation
+    let entries = sched.list(&key).await;
+    assert_eq!(entries.len(), 1);
+    let id = &entries[0].id;
+    let short_id = &id[..8.min(id.len())];
+
+    // Delete it
+    h.handle(make_msg(
+        key.clone(),
+        &format!("/schedule-delete {short_id}"),
+    ))
+    .await;
+    drain_until(&platform, |r| r.iter().any(|x| x.text.contains("deleted"))).await;
+
+    // Verify empty
+    let entries = sched.list(&key).await;
+    assert!(entries.is_empty());
+
+    engine.shutdown().await;
+}
+
+#[tokio::test]
+async fn schedule_shows_usage_without_args() {
+    let platform = Arc::new(MockPlatform::new("mock"));
+    let (engine, _sched) = make_engine_with_scheduler(platform.clone());
+    let h: Arc<dyn MessageHandler> = engine.clone();
+
+    h.handle(make_msg(SessionKey::new("mock", "u-help"), "/schedule"))
+        .await;
+    drain_until(&platform, |r| r.iter().any(|x| x.text.contains("usage:"))).await;
+    let replies = platform.replies().await;
+    assert!(replies.iter().any(|r| r.text.contains("usage:")));
+
+    engine.shutdown().await;
+}
+
+#[tokio::test]
+async fn schedule_list_empty() {
+    let platform = Arc::new(MockPlatform::new("mock"));
+    let (engine, _sched) = make_engine_with_scheduler(platform.clone());
+    let h: Arc<dyn MessageHandler> = engine.clone();
+
+    h.handle(make_msg(
+        SessionKey::new("mock", "u-empty"),
+        "/schedule-list",
+    ))
+    .await;
+    drain_until(&platform, |r| {
+        r.iter().any(|x| x.text.contains("no scheduled"))
+    })
+    .await;
+    let replies = platform.replies().await;
+    assert!(replies.iter().any(|r| r.text.contains("no scheduled")));
+
+    engine.shutdown().await;
+}
+
+#[tokio::test]
+async fn schedule_invalid_format_reports_error() {
+    let platform = Arc::new(MockPlatform::new("mock"));
+    let (engine, _sched) = make_engine_with_scheduler(platform.clone());
+    let h: Arc<dyn MessageHandler> = engine.clone();
+
+    h.handle(make_msg(
+        SessionKey::new("mock", "u-bad"),
+        "/schedule tomorrow \"test\"",
+    ))
+    .await;
+    drain_until(&platform, |r| {
+        r.iter().any(|x| x.text.contains("invalid schedule"))
+    })
+    .await;
+    let replies = platform.replies().await;
+    assert!(replies.iter().any(|r| r.text.contains("invalid schedule")));
+
+    engine.shutdown().await;
+}
+
+#[tokio::test]
+async fn help_lists_schedule_commands() {
+    let platform = Arc::new(MockPlatform::new("mock"));
+    let (engine, _sched) = make_engine_with_scheduler(platform.clone());
+    let h: Arc<dyn MessageHandler> = engine.clone();
+
+    h.handle(make_msg(SessionKey::new("mock", "u-h2"), "/help"))
+        .await;
+    drain_until(&platform, |r| {
+        r.iter().any(|x| x.text.contains("/schedule"))
+    })
+    .await;
+    let replies = platform.replies().await;
+    let body = &replies
+        .iter()
+        .find(|r| r.text.contains("/schedule"))
+        .unwrap()
+        .text;
+    assert!(body.contains("/schedule-list"));
+    assert!(body.contains("/schedule-delete"));
 
     engine.shutdown().await;
 }

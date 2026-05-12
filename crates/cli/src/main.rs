@@ -34,6 +34,16 @@ fn expand_tilde(p: PathBuf) -> PathBuf {
     p
 }
 
+fn resolve_state_path(cfg: &AppConfig) -> PathBuf {
+    let agent_name = &cfg.bridge.default_agent;
+    if let Some(agent) = cfg.agents.get(agent_name) {
+        if let Some(ref base_dir) = agent.client_config_base_dir {
+            return expand_tilde(base_dir.clone()).join("state.json");
+        }
+    }
+    cfg.bridge.state_dir.join("state.json")
+}
+
 #[derive(Parser, Debug)]
 #[command(name = "aab", version, about = "AI Agent Bridge for chat platforms")]
 struct Cli {
@@ -155,7 +165,7 @@ async fn run(
 
     let agent = build_agent(&agent_name, &cfg)?;
 
-    let state_path = cfg.bridge.state_dir.join("state.json");
+    let state_path = resolve_state_path(&cfg);
     let registry = Arc::new(Mutex::new(SessionRegistry::open(state_path)?));
 
     let mut builder = Engine::builder()
@@ -173,6 +183,11 @@ async fn run(
     }
 
     let engine = builder.build()?;
+
+    // Spawn the scheduler and attach it to the engine.
+    let sched = core_engine::Scheduler::spawn(engine.clone(), engine.registry().clone());
+    sched.reload_from_registry().await?;
+    engine.set_scheduler(sched);
 
     let joined = platform_names.join(",");
     info!(%agent_name, platforms=%joined, "engine starting");
@@ -418,7 +433,7 @@ async fn build_publisher(
 }
 
 async fn session_action(cfg: AppConfig, action: SessionAction) -> Result<()> {
-    let path = cfg.bridge.state_dir.join("state.json");
+    let path = resolve_state_path(&cfg);
     let mut reg = SessionRegistry::open(path)?;
     match action {
         SessionAction::List => {

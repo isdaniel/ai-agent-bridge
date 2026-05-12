@@ -2,11 +2,12 @@
 
 pub mod framing;
 pub mod registry;
+pub mod scheduler;
 pub mod session;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use anyhow::{anyhow, Context};
@@ -17,6 +18,7 @@ use tokio::sync::{mpsc, Mutex, RwLock};
 use tracing::{error, info, warn};
 
 pub use registry::{RegistryEntry, SessionRegistry};
+pub use scheduler::Scheduler;
 pub use session::{Cmd, SessionActor, SessionHandle};
 
 /// The orchestrator. Holds the agent backends, the active platform, the
@@ -40,6 +42,8 @@ pub struct Engine {
     /// Idle timeout for session actors. Sessions with no activity for this
     /// duration will self-close and release agent resources.
     idle_timeout: Duration,
+    /// Background scheduler for timed/recurring actions.
+    scheduler: OnceLock<Arc<Scheduler>>,
 }
 
 impl Engine {
@@ -49,6 +53,18 @@ impl Engine {
 
     pub fn commands(&self) -> Arc<RwLock<CommandRegistry>> {
         self.commands.clone()
+    }
+
+    pub fn scheduler(&self) -> Option<&Arc<Scheduler>> {
+        self.scheduler.get()
+    }
+
+    pub fn set_scheduler(&self, s: Arc<Scheduler>) {
+        let _ = self.scheduler.set(s);
+    }
+
+    pub fn registry(&self) -> &Arc<Mutex<SessionRegistry>> {
+        &self.registry
     }
 
     /// Returns all registered platforms.
@@ -232,7 +248,8 @@ impl Engine {
         key: &SessionKey,
         reply_ctx: &ReplyCtx,
     ) -> Result<()> {
-        match name {
+        let normalized = name.replace('-', "_");
+        match normalized.as_str() {
             "help" => {
                 let reg = self.commands.read().await;
                 let mut lines = vec!["Available commands:".to_string()];
@@ -285,6 +302,15 @@ impl Engine {
             }
             "skills" => {
                 self.handle_skills(key, reply_ctx).await?;
+            }
+            "schedule" => {
+                self.handle_schedule(args, key, reply_ctx).await?;
+            }
+            "schedule_list" => {
+                self.handle_schedule_list(key, reply_ctx).await?;
+            }
+            "schedule_delete" => {
+                self.handle_schedule_delete(args, key, reply_ctx).await?;
             }
             other => {
                 self.platform_for(key)
@@ -471,6 +497,173 @@ impl Engine {
         Ok(())
     }
 
+    async fn handle_schedule(
+        &self,
+        args: &[&str],
+        key: &SessionKey,
+        reply_ctx: &ReplyCtx,
+    ) -> Result<()> {
+        let Some(sched) = self.scheduler.get() else {
+            self.platform_for(key)
+                .reply(reply_ctx, "scheduler not enabled.")
+                .await?;
+            return Ok(());
+        };
+
+        if args.is_empty() {
+            self.platform_for(key)
+                .reply(
+                    reply_ctx,
+                    "usage: /schedule <when> \"<prompt>\"\n\
+                     examples:\n\
+                     \x20 /schedule in 30m \"check build status\"\n\
+                     \x20 /schedule every 1h \"report metrics\"\n\
+                     \x20 /schedule every day 09:00 \"good morning\"\n\
+                     \x20 /schedule at 14:00 \"start deployment\"\n\
+                     times are UTC.",
+                )
+                .await?;
+            return Ok(());
+        }
+
+        // The tokenizer already strips quotes, so the last arg is the prompt
+        // and everything before it is the time spec.
+        // We need at least 2 args: time spec + prompt.
+        if args.len() < 2 {
+            self.platform_for(key)
+                .reply(
+                    reply_ctx,
+                    "usage: /schedule <when> \"<prompt>\"\n\
+                     examples:\n\
+                     \x20 /schedule in 30m \"check build status\"\n\
+                     \x20 /schedule every 1h \"report metrics\"",
+                )
+                .await?;
+            return Ok(());
+        }
+
+        let prompt = args.last().unwrap().to_string();
+        let time_spec = args[..args.len() - 1].join(" ");
+
+        if prompt.is_empty() || time_spec.is_empty() {
+            self.platform_for(key)
+                .reply(reply_ctx, "usage: /schedule <when> \"<prompt>\"")
+                .await?;
+            return Ok(());
+        }
+
+        match scheduler::parse_schedule(&time_spec) {
+            Ok(schedule) => {
+                let entry = scheduler::ScheduleEntry {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    key: key.clone(),
+                    prompt: prompt.clone(),
+                    reply_ctx: reply_ctx.clone(),
+                    schedule,
+                    created_at_ms: now_ms(),
+                    last_fired_ms: None,
+                };
+                let display = entry.display_schedule();
+                let id = entry.id.clone();
+                sched.add(entry).await?;
+                self.platform_for(key)
+                    .reply(
+                        reply_ctx,
+                        &format!("scheduled (id={id}):\n  {display}\n  prompt: \"{prompt}\""),
+                    )
+                    .await?;
+            }
+            Err(e) => {
+                self.platform_for(key)
+                    .reply(reply_ctx, &format!("invalid schedule: {e}"))
+                    .await?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn handle_schedule_list(&self, key: &SessionKey, reply_ctx: &ReplyCtx) -> Result<()> {
+        let Some(sched) = self.scheduler.get() else {
+            self.platform_for(key)
+                .reply(reply_ctx, "scheduler not enabled.")
+                .await?;
+            return Ok(());
+        };
+
+        let entries = sched.list(key).await;
+        if entries.is_empty() {
+            self.platform_for(key)
+                .reply(reply_ctx, "no scheduled actions.")
+                .await?;
+        } else {
+            let mut lines = vec![format!("Scheduled actions ({}):", entries.len())];
+            for e in &entries {
+                lines.push(format!(
+                    "  [{}] {} — \"{}\"",
+                    &e.id[..8.min(e.id.len())],
+                    e.display_schedule(),
+                    e.prompt,
+                ));
+            }
+            self.platform_for(key)
+                .reply(reply_ctx, &lines.join("\n"))
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn handle_schedule_delete(
+        &self,
+        args: &[&str],
+        key: &SessionKey,
+        reply_ctx: &ReplyCtx,
+    ) -> Result<()> {
+        let Some(sched) = self.scheduler.get() else {
+            self.platform_for(key)
+                .reply(reply_ctx, "scheduler not enabled.")
+                .await?;
+            return Ok(());
+        };
+
+        let id = args.first().copied().unwrap_or("");
+        if id.is_empty() {
+            self.platform_for(key)
+                .reply(reply_ctx, "usage: /schedule-delete <id>")
+                .await?;
+            return Ok(());
+        }
+
+        // Support prefix matching for convenience.
+        let entries = sched.list(key).await;
+        let matches: Vec<_> = entries.iter().filter(|e| e.id.starts_with(id)).collect();
+        match matches.len() {
+            0 => {
+                self.platform_for(key)
+                    .reply(reply_ctx, &format!("no schedule found matching `{id}`"))
+                    .await?;
+            }
+            1 => {
+                let full_id = matches[0].id.clone();
+                sched.remove(key, &full_id).await?;
+                self.platform_for(key)
+                    .reply(
+                        reply_ctx,
+                        &format!("deleted schedule `{}`", &full_id[..8.min(full_id.len())]),
+                    )
+                    .await?;
+            }
+            n => {
+                self.platform_for(key)
+                    .reply(
+                        reply_ctx,
+                        &format!("`{id}` matches {n} schedules — be more specific."),
+                    )
+                    .await?;
+            }
+        }
+        Ok(())
+    }
+
     async fn get_or_spawn_session(
         &self,
         key: &SessionKey,
@@ -529,6 +722,7 @@ impl Engine {
             agent_name.clone(),
             self.batch_replies,
             self.idle_timeout,
+            self.scheduler.get().cloned(),
         );
 
         {
@@ -733,6 +927,7 @@ impl EngineBuilder {
             max_sessions: self.max_sessions.unwrap_or(96),
             batch_replies: self.batch_replies,
             idle_timeout: self.idle_timeout.unwrap_or(Duration::from_secs(1800)),
+            scheduler: OnceLock::new(),
         }))
     }
 }
@@ -760,6 +955,15 @@ fn builtin_commands() -> Vec<CommandSpec> {
         ),
         b("mcp", "show MCP servers configured for this client"),
         b("skills", "show skills/settings configured for this client"),
+        b(
+            "schedule",
+            "schedule a prompt: /schedule <when> \"<prompt>\"",
+        ),
+        b("schedule-list", "list your scheduled actions"),
+        b(
+            "schedule-delete",
+            "delete a schedule: /schedule-delete <id>",
+        ),
     ]
 }
 
@@ -883,5 +1087,92 @@ mod tests {
 
         // Not a prefix — returns None
         assert!(engine.parse_agent_prefix("hello @other").is_none());
+    }
+
+    // ── EngineBuilder validation tests ──────────────────────────────────
+
+    #[test]
+    fn builder_no_agent_fails() {
+        let result = Engine::builder()
+            .default_agent("echo")
+            .platform(Arc::new(MockPlatform::new("t")))
+            .build();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn builder_no_platform_fails() {
+        let result = Engine::builder()
+            .add_agent(Arc::new(EchoAgent))
+            .default_agent("echo")
+            .build();
+        assert!(result.is_err());
+        let err = result.err().unwrap().to_string();
+        assert!(err.contains("platform"));
+    }
+
+    #[test]
+    fn builder_wrong_default_agent_fails() {
+        let result = Engine::builder()
+            .add_agent(Arc::new(EchoAgent))
+            .default_agent("nonexistent")
+            .platform(Arc::new(MockPlatform::new("t")))
+            .build();
+        assert!(result.is_err());
+        let err = result.err().unwrap().to_string();
+        assert!(err.contains("nonexistent"));
+    }
+
+    #[test]
+    fn builder_no_default_agent_fails() {
+        let result = Engine::builder()
+            .add_agent(Arc::new(EchoAgent))
+            .platform(Arc::new(MockPlatform::new("t")))
+            .build();
+        assert!(result.is_err());
+        let err = result.err().unwrap().to_string();
+        assert!(err.contains("default_agent"));
+    }
+
+    #[test]
+    fn platform_for_resolves_by_prefix() {
+        let p1 = Arc::new(MockPlatform::new("line"));
+        let p2 = Arc::new(MockPlatform::new("slack"));
+        let engine = Engine::builder()
+            .add_agent(Arc::new(EchoAgent))
+            .default_agent("echo")
+            .add_platform(p1)
+            .add_platform(p2)
+            .build()
+            .unwrap();
+
+        let key_line = SessionKey::new("line", "U1");
+        assert_eq!(engine.platform_for(&key_line).name(), "line");
+
+        let key_slack = SessionKey::new("slack", "U2");
+        assert_eq!(engine.platform_for(&key_slack).name(), "slack");
+    }
+
+    #[test]
+    fn platform_for_fallback_on_unknown() {
+        let platform = Arc::new(MockPlatform::new("fallback"));
+        let engine = Engine::builder()
+            .add_agent(Arc::new(EchoAgent))
+            .default_agent("echo")
+            .platform(platform)
+            .build()
+            .unwrap();
+
+        let key = SessionKey::new("unknown", "U1");
+        assert_eq!(engine.platform_for(&key).name(), "fallback");
+    }
+
+    #[test]
+    fn builtin_commands_includes_schedule() {
+        let cmds = builtin_commands();
+        let names: Vec<&str> = cmds.iter().map(|c| c.name.as_str()).collect();
+        assert!(names.contains(&"schedule"));
+        assert!(names.contains(&"schedule-list"));
+        assert!(names.contains(&"schedule-delete"));
     }
 }

@@ -253,3 +253,96 @@ struct TgUser {
 struct TgChat {
     id: i64,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn api_response_ok_parses() {
+        let json = r#"{"ok":true,"result":[{"update_id":1}]}"#;
+        let resp: ApiResponse<Vec<Update>> = serde_json::from_str(json).unwrap();
+        assert!(resp.ok);
+        assert_eq!(resp.result.unwrap().len(), 1);
+    }
+
+    #[test]
+    fn api_response_error_parses() {
+        let json = r#"{"ok":false,"description":"Unauthorized"}"#;
+        let resp: ApiResponse<Vec<Update>> = serde_json::from_str(json).unwrap();
+        assert!(!resp.ok);
+        assert_eq!(resp.description.as_deref(), Some("Unauthorized"));
+    }
+
+    #[test]
+    fn update_with_text_message_parses() {
+        let json = r#"{
+            "update_id": 100,
+            "message": {
+                "message_id": 42,
+                "from": {"id": 12345},
+                "chat": {"id": 67890},
+                "date": 1700000000,
+                "text": "hello world"
+            }
+        }"#;
+        let update: Update = serde_json::from_str(json).unwrap();
+        assert_eq!(update.update_id, 100);
+        let msg = update.message.unwrap();
+        assert_eq!(msg.text.as_deref(), Some("hello world"));
+        assert_eq!(msg.chat.id, 67890);
+        assert_eq!(msg.from.unwrap().id, 12345);
+        assert_eq!(msg.date, Some(1700000000));
+    }
+
+    #[test]
+    fn update_without_message_parses() {
+        let json = r#"{"update_id": 101}"#;
+        let update: Update = serde_json::from_str(json).unwrap();
+        assert!(update.message.is_none());
+    }
+
+    #[test]
+    fn update_without_text_parses() {
+        let json = r#"{
+            "update_id": 102,
+            "message": {
+                "chat": {"id": 1},
+                "date": 1700000000
+            }
+        }"#;
+        let update: Update = serde_json::from_str(json).unwrap();
+        let msg = update.message.unwrap();
+        assert!(msg.text.is_none());
+        assert!(msg.from.is_none());
+    }
+
+    #[test]
+    fn platform_name() {
+        let p = TelegramPlatform::new(TelegramConfig {
+            bot_token: "test".into(),
+        });
+        assert_eq!(p.name(), "telegram");
+    }
+
+    #[test]
+    fn api_url_format() {
+        let p = TelegramPlatform::new(TelegramConfig {
+            bot_token: "123:ABC".into(),
+        });
+        assert_eq!(
+            p.api_url("sendMessage"),
+            "https://api.telegram.org/bot123:ABC/sendMessage"
+        );
+    }
+
+    #[test]
+    fn text_split_at_telegram_limit() {
+        let text = "A".repeat(8000);
+        let chunks = split_text(&text, TELEGRAM_TEXT_MAX);
+        assert!(chunks.len() >= 2);
+        for chunk in &chunks {
+            assert!(chunk.len() <= TELEGRAM_TEXT_MAX);
+        }
+    }
+}

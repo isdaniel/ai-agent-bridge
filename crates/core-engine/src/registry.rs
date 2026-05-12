@@ -10,7 +10,9 @@ use anyhow::Result;
 use core_traits::SessionKey;
 use serde::{Deserialize, Serialize};
 
-const SCHEMA_VERSION: u32 = 1;
+use crate::scheduler::ScheduleEntry;
+
+const SCHEMA_VERSION: u32 = 2;
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct RegistryEntry {
@@ -24,11 +26,14 @@ pub struct RegistryEntry {
 struct StateFile {
     schema_version: u32,
     entries: HashMap<String, RegistryEntry>,
+    #[serde(default)]
+    schedules: Vec<ScheduleEntry>,
 }
 
 pub struct SessionRegistry {
     path: Option<PathBuf>,
     entries: HashMap<SessionKey, RegistryEntry>,
+    schedules: Vec<ScheduleEntry>,
 }
 
 impl SessionRegistry {
@@ -36,6 +41,7 @@ impl SessionRegistry {
         Self {
             path: None,
             entries: HashMap::new(),
+            schedules: Vec::new(),
         }
     }
 
@@ -43,24 +49,28 @@ impl SessionRegistry {
         let mut me = Self {
             path: Some(path.clone()),
             entries: HashMap::new(),
+            schedules: Vec::new(),
         };
         if path.exists() {
             let raw = std::fs::read_to_string(&path)?;
             let parsed: StateFile = serde_json::from_str(&raw)?;
-            if parsed.schema_version != SCHEMA_VERSION {
+            if parsed.schema_version > SCHEMA_VERSION {
                 let bak = path.with_extension("json.bak");
                 let _ = std::fs::rename(&path, bak);
                 tracing::warn!(
                     found = parsed.schema_version,
                     expected = SCHEMA_VERSION,
-                    "state.json schema mismatch; renamed to .bak"
+                    "state.json schema from the future; renamed to .bak"
                 );
             } else {
+                // Accept v1 (missing schedules field → empty via #[serde(default)])
+                // and v2 directly.
                 me.entries = parsed
                     .entries
                     .into_iter()
                     .map(|(k, v)| (SessionKey(k), v))
                     .collect();
+                me.schedules = parsed.schedules;
             }
         }
         Ok(me)
@@ -109,6 +119,14 @@ impl SessionRegistry {
         &self.entries
     }
 
+    pub fn schedules(&self) -> &[ScheduleEntry] {
+        &self.schedules
+    }
+
+    pub fn set_schedules(&mut self, schedules: Vec<ScheduleEntry>) {
+        self.schedules = schedules;
+    }
+
     /// Set or replace the active agent for `key`. If a different agent was
     /// previously active, its session_id is archived to history.
     pub fn set_agent(&mut self, key: SessionKey, agent: String) {
@@ -136,6 +154,7 @@ impl SessionRegistry {
                 .iter()
                 .map(|(k, v)| (k.0.clone(), v.clone()))
                 .collect(),
+            schedules: self.schedules.clone(),
         };
         let json = serde_json::to_vec_pretty(&snapshot)?;
         let path = path.clone();
@@ -245,5 +264,100 @@ mod tests {
         reg.record_session(k.clone(), "claude".into(), "s1".into());
         let e = reg.entries.get(&k).unwrap();
         assert!(e.past_agent_session_ids.is_empty());
+    }
+
+    #[test]
+    fn schedules_default_empty() {
+        let reg = SessionRegistry::in_memory();
+        assert!(reg.schedules().is_empty());
+    }
+
+    #[test]
+    fn set_schedules_and_read_back() {
+        use crate::scheduler::{ScheduleEntry, ScheduleKind};
+        use core_traits::ReplyCtx;
+
+        let mut reg = SessionRegistry::in_memory();
+        let entries = vec![ScheduleEntry {
+            id: "s1".into(),
+            key: SessionKey::new("line", "U1"),
+            prompt: "hello".into(),
+            reply_ctx: ReplyCtx::default(),
+            schedule: ScheduleKind::Once {
+                fire_at_ms: 1_000_000,
+            },
+            created_at_ms: 0,
+            last_fired_ms: None,
+        }];
+        reg.set_schedules(entries.clone());
+        assert_eq!(reg.schedules().len(), 1);
+        assert_eq!(reg.schedules()[0].id, "s1");
+    }
+
+    #[tokio::test]
+    async fn schedules_round_trip_persistence() {
+        use crate::scheduler::{ScheduleEntry, ScheduleKind};
+        use core_traits::ReplyCtx;
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let mut reg = SessionRegistry::open(path.clone()).unwrap();
+        reg.set_schedules(vec![ScheduleEntry {
+            id: "sched-1".into(),
+            key: SessionKey::new("slack", "U99"),
+            prompt: "status check".into(),
+            reply_ctx: ReplyCtx::default(),
+            schedule: ScheduleKind::Recurring {
+                interval_ms: 3_600_000,
+                next_fire_ms: 2_000_000_000_000,
+            },
+            created_at_ms: 1_000_000_000_000,
+            last_fired_ms: None,
+        }]);
+        reg.persist().await.unwrap();
+
+        let reg2 = SessionRegistry::open(path).unwrap();
+        assert_eq!(reg2.schedules().len(), 1);
+        assert_eq!(reg2.schedules()[0].id, "sched-1");
+        assert_eq!(reg2.schedules()[0].prompt, "status check");
+    }
+
+    #[tokio::test]
+    async fn v1_state_file_migrates_to_v2() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        // Write a v1 state file (no schedules field)
+        let v1 = serde_json::json!({
+            "schema_version": 1,
+            "entries": {
+                "line:U1": {
+                    "agent": "claude",
+                    "active_session_id": "sess-1",
+                    "past_agent_session_ids": []
+                }
+            }
+        });
+        std::fs::write(&path, serde_json::to_string_pretty(&v1).unwrap()).unwrap();
+
+        let reg = SessionRegistry::open(path).unwrap();
+        let k = SessionKey::new("line", "U1");
+        assert_eq!(reg.agent_for(&k).as_deref(), Some("claude"));
+        assert_eq!(reg.last_session_id(&k).as_deref(), Some("sess-1"));
+        assert!(reg.schedules().is_empty());
+    }
+
+    #[tokio::test]
+    async fn future_schema_renames_to_bak() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let future = serde_json::json!({
+            "schema_version": 999,
+            "entries": {}
+        });
+        std::fs::write(&path, serde_json::to_string(&future).unwrap()).unwrap();
+
+        let reg = SessionRegistry::open(path.clone()).unwrap();
+        assert!(reg.entries().is_empty());
+        assert!(path.with_extension("json.bak").exists());
     }
 }

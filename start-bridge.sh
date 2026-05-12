@@ -35,7 +35,7 @@
 
 set -euo pipefail
 
-PLATFORM="slack"
+PLATFORM="slack,line"
 AGENT="claude"
 PROFILE="release"
 USE_TUNNEL=1
