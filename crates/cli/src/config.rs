@@ -31,6 +31,12 @@ pub struct BridgeSection {
     /// Set to 0 to disable the cap (not recommended on a shared host).
     #[serde(default = "default_max_sessions")]
     pub max_sessions: usize,
+    /// Idle timeout in seconds for session actors. Default 1800 (30 min).
+    #[serde(default = "default_idle_timeout_secs")]
+    pub idle_timeout_secs: u64,
+    /// Bind address for the admin/observability API. Default "0.0.0.0:9090".
+    #[serde(default = "default_admin_bind")]
+    pub admin_bind: String,
 }
 
 fn default_agent() -> String {
@@ -41,6 +47,12 @@ fn default_platform() -> String {
 }
 fn default_max_sessions() -> usize {
     96
+}
+fn default_idle_timeout_secs() -> u64 {
+    1800
+}
+fn default_admin_bind() -> String {
+    "0.0.0.0:9095".into()
 }
 fn default_state_dir() -> PathBuf {
     if let Some(home) = dirs_home() {
@@ -86,6 +98,8 @@ pub struct AgentSection {
 pub struct PlatformsSection {
     pub line: Option<LineSection>,
     pub slack: Option<SlackSection>,
+    pub telegram: Option<TelegramSection>,
+    pub discord: Option<DiscordSection>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -95,6 +109,9 @@ pub struct LineSection {
     pub webhook_bind: Option<String>,
     pub allowlist: Option<Vec<String>>,
     pub media: Option<MediaSection>,
+    /// Monthly push message limit. When set, the bridge tracks push count and
+    /// rejects further pushes when exhausted. Resets on process restart.
+    pub push_limit: Option<u64>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -122,6 +139,16 @@ pub struct SlackSection {
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct TelegramSection {
+    pub bot_token_env: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct DiscordSection {
+    pub bot_token_env: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct ProviderSection {
     pub base_url: Option<String>,
     pub model: Option<String>,
@@ -134,6 +161,8 @@ impl Default for BridgeSection {
             default_platform: default_platform(),
             state_dir: default_state_dir(),
             max_sessions: default_max_sessions(),
+            idle_timeout_secs: default_idle_timeout_secs(),
+            admin_bind: default_admin_bind(),
         }
     }
 }

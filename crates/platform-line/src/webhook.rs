@@ -1,6 +1,7 @@
 //! Axum router for the LINE webhook endpoint.
 
 use std::sync::Arc;
+use std::time::Instant;
 
 use axum::{
     body::Bytes,
@@ -13,11 +14,15 @@ use axum::{
 use core_traits::{
     safe_filename, Attachment, AttachmentKind, Message, MessageHandler, ReplyCtx, SessionKey,
 };
+use dashmap::DashMap;
 use serde::Deserialize;
 use tracing::{debug, warn};
 
 use crate::sign::verify_signature;
 use crate::{now_ms, LineConfig};
+
+const DEDUP_TTL_SECS: u64 = 60;
+const DEDUP_MAX_ENTRIES: usize = 10_000;
 
 #[derive(Clone)]
 struct AppState {
@@ -25,6 +30,7 @@ struct AppState {
     boot_ms: i64,
     handler: Arc<dyn MessageHandler>,
     http: reqwest::Client,
+    seen_requests: Arc<DashMap<String, Instant>>,
 }
 
 pub fn router(cfg: LineConfig, boot_ms: i64, handler: Arc<dyn MessageHandler>) -> Router {
@@ -33,6 +39,7 @@ pub fn router(cfg: LineConfig, boot_ms: i64, handler: Arc<dyn MessageHandler>) -
         boot_ms,
         handler,
         http: reqwest::Client::new(),
+        seen_requests: Arc::new(DashMap::new()),
     };
     Router::new()
         .route("/webhook", post(handle_webhook))
@@ -45,6 +52,25 @@ async fn handle_webhook(
     headers: HeaderMap,
     body: Bytes,
 ) -> impl IntoResponse {
+    // Replay protection: deduplicate by X-Line-Request-Id
+    if let Some(request_id) = headers
+        .get("x-line-request-id")
+        .and_then(|v| v.to_str().ok())
+    {
+        let now = Instant::now();
+        if state.seen_requests.contains_key(request_id) {
+            debug!(request_id, "LINE webhook replay detected; skipping");
+            return StatusCode::OK.into_response();
+        }
+        state.seen_requests.insert(request_id.to_string(), now);
+        // Evict stale entries if map grows too large
+        if state.seen_requests.len() > DEDUP_MAX_ENTRIES {
+            state
+                .seen_requests
+                .retain(|_, ts| ts.elapsed().as_secs() < DEDUP_TTL_SECS);
+        }
+    }
+
     let sig = headers
         .get("x-line-signature")
         .and_then(|v| v.to_str().ok())

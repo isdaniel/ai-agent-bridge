@@ -6,13 +6,13 @@ maintainer touching this repo. Read this before changing anything.
 ## 1. Project in one paragraph
 
 `ai-agent-bridge` (binary `aab`) is a Rust workspace that bridges chat
-platforms (LINE, Slack, local stdio) to AI agent **CLIs** that are already
-installed and authenticated on the host (Claude Code, GitHub Copilot CLI,
-ACP servers). Chat messages are forwarded to the CLI's stdin verbatim; CLI
-stdout is forwarded back to the chat thread. **The bridge holds no API keys
-for the core path** — auth/billing/tool execution all live inside the CLI.
-An OpenAI-compatible HTTP escape hatch (`agent-http`) exists but is not
-the primary mode and is not in `default` features.
+platforms (LINE, Slack, Telegram, Discord, local stdio) to AI agent **CLIs**
+that are already installed and authenticated on the host (Claude Code, GitHub
+Copilot CLI, ACP servers). Chat messages are forwarded to the CLI's stdin
+verbatim; CLI stdout is forwarded back to the chat thread. **The bridge holds
+no API keys for the core path** — auth/billing/tool execution all live inside
+the CLI. An OpenAI-compatible HTTP escape hatch (`agent-http`) exists but is
+not the primary mode and is not in `default` features.
 
 Linux-only target. The codebase compiles on macOS/Windows but daemon
 helpers and `start-bridge.sh` assume systemd-user.
@@ -121,6 +121,20 @@ crates/
 ├── platform-stdio/      Local terminal frontend. Read stdin lines,
 │                        print replies. For dev / smoke test / CI.
 │
+├── platform-telegram/   Telegram Bot API. Long-poll via getUpdates
+│                        (no webhook/tunnel needed). sendMessage,
+│                        sendDocument, sendPhoto, sendAudio. Typing
+│                        via sendChatAction (free, 5 s TTL).
+│
+├── platform-discord/    Discord Gateway WebSocket + REST API.
+│                        Identifies with GUILD_MESSAGES + DIRECT_MESSAGES
+│                        + MESSAGE_CONTENT intents. Mention-only in guilds,
+│                        always responds in DMs. Auto heartbeat/reconnect.
+│
+├── admin-api/           Lightweight axum server for observability:
+│                        GET /healthz, /api/metrics, /api/sessions.
+│                        Reads Engine::stats() on demand.
+│
 ├── media-publisher/     MediaPublisher trait + LocalHttpPublisher (in-
 │                        process axum file server keyed by UUID). For
 │                        platforms that need a public URL (LINE outbound).
@@ -141,8 +155,9 @@ crates/
 │   └── config.rs        figment chain: defaults → TOML → env (AAB_*
 │                        prefix, __ section separator).
 │
-└── test-support/        EchoAgent + MockPlatform fixtures used by
-                         core-engine integration tests.
+└── test-support/        EchoAgent + SlowAgent + StreamingAgent +
+                         MockPlatform fixtures used by core-engine
+                         integration tests.
 ```
 
 ## 3. Crate dependency invariants
@@ -311,6 +326,8 @@ CI runs all three on every PR (Linux only). Don't merge red.
 - LINE imageSet (multi-shot) grouping
 - ACP `set_session_mode` / `fs/*` server hooks (spec still in flux)
 - `AgentSession::set_model` for hot model switch without `/reset`
+- Telegram webhook mode (alternative to long-poll for high-traffic bots)
+- Discord voice channel integration
 
 ## 11. Where to look when something breaks
 

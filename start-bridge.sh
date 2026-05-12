@@ -2,9 +2,13 @@
 # start-bridge.sh — one-shot launcher for ai-agent-bridge on Linux.
 #
 # Usage:
-#   ./start-bridge.sh                       # line + claude (default)
+#   ./start-bridge.sh                       # slack + claude (default)
 #   ./start-bridge.sh --platform stdio      # local terminal smoke test
 #   ./start-bridge.sh --platform slack      # Slack Socket Mode (no tunnel)
+#   ./start-bridge.sh --platform telegram   # Telegram long-poll (no tunnel)
+#   ./start-bridge.sh --platform discord    # Discord Gateway WS (no tunnel)
+#   ./start-bridge.sh --platform line       # LINE (needs tunnel for webhook)
+#   ./start-bridge.sh --platform "line,slack" # multi-platform (comma-separated)
 #   ./start-bridge.sh --agent copilot       # any agent supported by `aab`
 #   ./start-bridge.sh --no-tunnel           # skip cloudflared (you have your own ingress)
 #   ./start-bridge.sh --release|--debug     # build profile (default: release)
@@ -16,6 +20,8 @@
 #     LINE_CHANNEL_TOKEN=...
 #     SLACK_APP_TOKEN=xapp-...
 #     SLACK_BOT_TOKEN=xoxb-...
+#     TELEGRAM_BOT_TOKEN=...
+#     DISCORD_BOT_TOKEN=...
 #     AAB_LOG=info,platform_line=debug
 #
 # Behaviour:
@@ -88,18 +94,33 @@ if [[ "$AGENT" == "claude" ]] && ! command -v claude >/dev/null 2>&1; then
   exit 1
 fi
 
-case "$PLATFORM" in
-  line)
-    : "${LINE_CHANNEL_SECRET:?LINE_CHANNEL_SECRET not set (put it in .env)}"
-    : "${LINE_CHANNEL_TOKEN:?LINE_CHANNEL_TOKEN not set (put it in .env)}"
-    ;;
-  slack)
-    : "${SLACK_APP_TOKEN:?SLACK_APP_TOKEN not set (put it in .env)}"
-    : "${SLACK_BOT_TOKEN:?SLACK_BOT_TOKEN not set (put it in .env)}"
-    ;;
-  stdio) ;;
-  *) echo "unknown platform: $PLATFORM" >&2; exit 2 ;;
-esac
+# Support comma-separated multi-platform (e.g., "line,slack").
+IFS=',' read -ra PLATFORM_LIST <<< "$PLATFORM"
+
+check_platform_env() {
+  case "$1" in
+    line)
+      : "${LINE_CHANNEL_SECRET:?LINE_CHANNEL_SECRET not set (put it in .env)}"
+      : "${LINE_CHANNEL_TOKEN:?LINE_CHANNEL_TOKEN not set (put it in .env)}"
+      ;;
+    slack)
+      : "${SLACK_APP_TOKEN:?SLACK_APP_TOKEN not set (put it in .env)}"
+      : "${SLACK_BOT_TOKEN:?SLACK_BOT_TOKEN not set (put it in .env)}"
+      ;;
+    telegram)
+      : "${TELEGRAM_BOT_TOKEN:?TELEGRAM_BOT_TOKEN not set (put it in .env)}"
+      ;;
+    discord)
+      : "${DISCORD_BOT_TOKEN:?DISCORD_BOT_TOKEN not set (put it in .env)}"
+      ;;
+    stdio) ;;
+    *) echo "unknown platform: $1" >&2; exit 2 ;;
+  esac
+}
+
+for p in "${PLATFORM_LIST[@]}"; do
+  check_platform_env "$p"
+done
 
 # ── Cleanup ───────────────────────────────────────────────────────────────
 PIDS=()
@@ -196,7 +217,12 @@ start_cloudflared_tunnel() {
 }
 
 # ── Tunnels (line only) ──────────────────────────────────────────────────
-if [[ "$PLATFORM" == "line" && "$USE_TUNNEL" -eq 1 ]]; then
+NEEDS_LINE_TUNNEL=0
+for p in "${PLATFORM_LIST[@]}"; do
+  if [[ "$p" == "line" ]]; then NEEDS_LINE_TUNNEL=1; fi
+done
+
+if [[ "$NEEDS_LINE_TUNNEL" -eq 1 && "$USE_TUNNEL" -eq 1 ]]; then
   MEDIA_PORT="${AAB_MEDIA_PORT:-8081}"
 
   # Webhook tunnel: use ngrok (fixed domain) if NGROK_DOMAIN is set,
@@ -244,8 +270,12 @@ if [[ "$AGENT" == "claude" && -z "${AAB_AGENTS__CLAUDE__APPEND_SYSTEM_PROMPT:-}"
 fi
 
 # ── aab ───────────────────────────────────────────────────────────────────
-echo "→ launching aab run --agent $AGENT --platform $PLATFORM"
-"$AAB_BIN" run --agent "$AGENT" --platform "$PLATFORM" &
+PLATFORM_ARGS=()
+for p in "${PLATFORM_LIST[@]}"; do
+  PLATFORM_ARGS+=(--platform "$p")
+done
+echo "→ launching aab run --agent $AGENT ${PLATFORM_ARGS[*]}"
+"$AAB_BIN" run --agent "$AGENT" "${PLATFORM_ARGS[@]}" &
 AAB_PID=$!
 PIDS+=("$AAB_PID")
 

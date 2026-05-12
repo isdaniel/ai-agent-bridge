@@ -2,6 +2,7 @@
 //! the workspace.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use core_traits::{
@@ -52,6 +53,8 @@ impl Platform for MockPlatform {
     }
 }
 
+// ── EchoAgent ────────────────────────────────────────────────────────────────
+
 pub struct EchoAgent;
 
 #[async_trait]
@@ -99,6 +102,141 @@ impl AgentSession for EchoSession {
     }
     fn events(&mut self) -> mpsc::Receiver<Event> {
         let (tx, rx) = mpsc::channel(8);
+        self.tx = Some(tx);
+        rx
+    }
+    async fn answer_permission(&mut self, _id: String, _allow: bool) -> Result<()> {
+        Ok(())
+    }
+    async fn close(self: Box<Self>) -> Result<()> {
+        Ok(())
+    }
+}
+
+// ── SlowAgent — delays before first response ────────────────────────────────
+
+pub struct SlowAgent {
+    pub delay_ms: u64,
+}
+
+#[async_trait]
+impl Agent for SlowAgent {
+    fn name(&self) -> &'static str {
+        "slow"
+    }
+    async fn start_session(
+        &self,
+        _key: SessionKey,
+        _resume: Option<String>,
+    ) -> Result<Box<dyn AgentSession>> {
+        Ok(Box::new(SlowSession {
+            delay: Duration::from_millis(self.delay_ms),
+            id: "slow-1".into(),
+            tx: None,
+        }))
+    }
+}
+
+pub struct SlowSession {
+    delay: Duration,
+    id: String,
+    tx: Option<mpsc::Sender<Event>>,
+}
+
+#[async_trait]
+impl AgentSession for SlowSession {
+    fn id(&self) -> String {
+        self.id.clone()
+    }
+    async fn send(&mut self, prompt: String, _atts: Vec<Attachment>) -> Result<()> {
+        if let Some(tx) = &self.tx {
+            let tx = tx.clone();
+            let id = self.id.clone();
+            let delay = self.delay;
+            tokio::spawn(async move {
+                tokio::time::sleep(delay).await;
+                tx.send(Event::AssistantText {
+                    text: format!("echo: {prompt}"),
+                    partial: false,
+                })
+                .await
+                .ok();
+                tx.send(Event::Done { session_id: id }).await.ok();
+            });
+        }
+        Ok(())
+    }
+    fn events(&mut self) -> mpsc::Receiver<Event> {
+        let (tx, rx) = mpsc::channel(8);
+        self.tx = Some(tx);
+        rx
+    }
+    async fn answer_permission(&mut self, _id: String, _allow: bool) -> Result<()> {
+        Ok(())
+    }
+    async fn close(self: Box<Self>) -> Result<()> {
+        Ok(())
+    }
+}
+
+// ── StreamingAgent — emits partial chunks then a final non-partial ───────────
+
+pub struct StreamingAgent;
+
+#[async_trait]
+impl Agent for StreamingAgent {
+    fn name(&self) -> &'static str {
+        "streaming"
+    }
+    async fn start_session(
+        &self,
+        _key: SessionKey,
+        _resume: Option<String>,
+    ) -> Result<Box<dyn AgentSession>> {
+        Ok(Box::new(StreamingSession {
+            id: "stream-1".into(),
+            tx: None,
+        }))
+    }
+}
+
+pub struct StreamingSession {
+    id: String,
+    tx: Option<mpsc::Sender<Event>>,
+}
+
+#[async_trait]
+impl AgentSession for StreamingSession {
+    fn id(&self) -> String {
+        self.id.clone()
+    }
+    async fn send(&mut self, prompt: String, _atts: Vec<Attachment>) -> Result<()> {
+        if let Some(tx) = &self.tx {
+            let tx = tx.clone();
+            let id = self.id.clone();
+            tokio::spawn(async move {
+                for i in 0..3 {
+                    tx.send(Event::AssistantText {
+                        text: format!("chunk{i} "),
+                        partial: true,
+                    })
+                    .await
+                    .ok();
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                tx.send(Event::AssistantText {
+                    text: format!("echo: {prompt}"),
+                    partial: false,
+                })
+                .await
+                .ok();
+                tx.send(Event::Done { session_id: id }).await.ok();
+            });
+        }
+        Ok(())
+    }
+    fn events(&mut self) -> mpsc::Receiver<Event> {
+        let (tx, rx) = mpsc::channel(16);
         self.tx = Some(tx);
         rx
     }

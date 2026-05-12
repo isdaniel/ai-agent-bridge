@@ -11,6 +11,9 @@ members = [
     "crates/platform-line",
     "crates/platform-slack",
     "crates/platform-stdio",
+    "crates/platform-telegram",
+    "crates/platform-discord",
+    "crates/admin-api",
     "crates/media-publisher",
     "crates/daemon",
     "crates/cli",
@@ -71,6 +74,9 @@ agent-http = { path = "crates/agent-http" }
 platform-line = { path = "crates/platform-line" }
 platform-slack = { path = "crates/platform-slack" }
 platform-stdio = { path = "crates/platform-stdio" }
+platform-telegram = { path = "crates/platform-telegram" }
+platform-discord = { path = "crates/platform-discord" }
+admin-api = { path = "crates/admin-api" }
 media-publisher = { path = "crates/media-publisher" }
 daemon = { path = "crates/daemon" }
 test-support = { path = "crates/test-support" }

@@ -15,8 +15,8 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use core_traits::{
-    safe_filename, Attachment, AttachmentKind, Message, MessageHandler, Platform, ReplyCtx, Result,
-    SessionKey,
+    safe_filename, split_text, Attachment, AttachmentKind, Message, MessageHandler, Platform,
+    ReplyCtx, Result, SessionKey,
 };
 use dashmap::DashMap;
 use envelope::{Envelope, EventsApiPayload, MessageEvent, SlackEvent, SlackFile};
@@ -364,22 +364,25 @@ impl Platform for SlackPlatform {
             .channel
             .as_deref()
             .ok_or_else(|| anyhow::anyhow!("Slack reply requires channel"))?;
-        let mut body = serde_json::json!({
-            "channel": channel,
-            "text": text,
-        });
-        if let Some(ts) = &ctx.thread {
-            body["thread_ts"] = serde_json::Value::String(ts.clone());
-        }
-        let resp = self
-            .http
-            .post("https://slack.com/api/chat.postMessage")
-            .bearer_auth(&self.cfg.bot_token)
-            .json(&body)
-            .send()
-            .await?;
-        if !resp.status().is_success() {
-            anyhow::bail!("slack postMessage HTTP {}", resp.status());
+        let chunks = split_text(text, 3900);
+        for chunk in chunks {
+            let mut body = serde_json::json!({
+                "channel": channel,
+                "text": chunk,
+            });
+            if let Some(ts) = &ctx.thread {
+                body["thread_ts"] = serde_json::Value::String(ts.clone());
+            }
+            let resp = self
+                .http
+                .post("https://slack.com/api/chat.postMessage")
+                .bearer_auth(&self.cfg.bot_token)
+                .json(&body)
+                .send()
+                .await?;
+            if !resp.status().is_success() {
+                anyhow::bail!("slack postMessage HTTP {}", resp.status());
+            }
         }
         Ok(())
     }

@@ -26,6 +26,7 @@ const INBOX_CAP: usize = 32;
 const FLUSH_INTERVAL: Duration = Duration::from_millis(1200);
 const FLUSH_THRESHOLD_BYTES: usize = 240;
 const THINKING_INTERVAL: Duration = Duration::from_secs(3);
+const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(1800);
 
 #[derive(Debug)]
 pub enum Cmd {
@@ -54,6 +55,28 @@ pub struct SessionActor {
 
 impl SessionActor {
     pub fn spawn(
+        session: Box<dyn AgentSession>,
+        platform: Arc<dyn Platform>,
+        reply_ctx: ReplyCtx,
+        registry: Arc<Mutex<SessionRegistry>>,
+        key: SessionKey,
+        agent_name: String,
+        batch_replies: bool,
+    ) -> Self {
+        Self::spawn_with_idle_timeout(
+            session,
+            platform,
+            reply_ctx,
+            registry,
+            key,
+            agent_name,
+            batch_replies,
+            DEFAULT_IDLE_TIMEOUT,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn spawn_with_idle_timeout(
         mut session: Box<dyn AgentSession>,
         platform: Arc<dyn Platform>,
         reply_ctx: ReplyCtx,
@@ -61,6 +84,7 @@ impl SessionActor {
         key: SessionKey,
         agent_name: String,
         batch_replies: bool,
+        idle_timeout: Duration,
     ) -> Self {
         let (tx, mut rx) = mpsc::channel::<Cmd>(INBOX_CAP);
         let mut events = session.events();
@@ -69,19 +93,30 @@ impl SessionActor {
             info!(?key, agent = %agent_name, sid = %session_id, batch = batch_replies, "session actor up");
             let mut state = StreamState::new(batch_replies);
             let mut reply_ctx = reply_ctx;
+            let mut last_activity = Instant::now();
             loop {
                 let deadline = state.next_deadline();
+                let idle_deadline = last_activity + idle_timeout;
+                let effective_deadline = match deadline {
+                    Some(d) => Some(d.min(idle_deadline)),
+                    None => Some(idle_deadline),
+                };
                 tokio::select! {
                     cmd = rx.recv() => match cmd {
                         Some(Cmd::Send { prompt, attachments, reply_ctx: ctx }) => {
+                            last_activity = Instant::now();
                             reply_ctx = ctx;
                             state.discard_buffer();
                             if let Err(e) = session.send(prompt, attachments).await {
                                 error!(error = %e, "session.send failed");
                                 let _ = platform.reply(&reply_ctx, &format!("agent error: {e}")).await;
+                            } else {
+                                state.waiting_for_response = true;
+                                state.last_thinking = Some(Instant::now());
                             }
                         }
                         Some(Cmd::Permission { id, allow }) => {
+                            last_activity = Instant::now();
                             if let Err(e) = session.answer_permission(id, allow).await {
                                 warn!(error = %e, "answer_permission failed");
                             }
@@ -92,17 +127,26 @@ impl SessionActor {
                         }
                     },
                     evt = events.recv() => match evt {
-                        Some(e) => handle_event(
-                            &platform, &reply_ctx, e, &registry, &key, &mut state,
-                        ).await,
+                        Some(e) => {
+                            last_activity = Instant::now();
+                            state.waiting_for_response = false;
+                            handle_event(
+                                &platform, &reply_ctx, e, &registry, &key, &mut state,
+                            ).await;
+                        }
                         None => {
                             debug!("agent events stream ended; closing session");
                             state.flush(&platform, &reply_ctx).await;
                             break;
                         }
                     },
-                    _ = sleep_until(deadline) => {
-                        if state.batch && state.processing {
+                    _ = sleep_until(effective_deadline) => {
+                        if last_activity.elapsed() >= idle_timeout && !state.processing && !state.waiting_for_response {
+                            info!(?key, "session idle timeout; closing");
+                            state.flush(&platform, &reply_ctx).await;
+                            break;
+                        }
+                        if (state.batch && state.processing) || state.waiting_for_response {
                             state.send_thinking(&platform, &reply_ctx).await;
                         } else {
                             state.flush(&platform, &reply_ctx).await;
@@ -141,6 +185,10 @@ struct StreamState {
     last_thinking: Option<Instant>,
     /// Counter for cycling through thinking messages.
     thinking_count: usize,
+    /// True between session.send() and the first event from the agent.
+    /// Prevents idle timeout from killing sessions where the agent is
+    /// thinking but hasn't emitted its first token yet.
+    waiting_for_response: bool,
 }
 
 impl StreamState {
@@ -153,11 +201,15 @@ impl StreamState {
 
     fn next_deadline(&self) -> Option<Instant> {
         if self.batch {
-            if self.processing {
+            if self.processing || self.waiting_for_response {
                 let base = self.last_thinking.unwrap_or_else(Instant::now);
                 return Some(base + THINKING_INTERVAL);
             }
             return None;
+        }
+        if self.waiting_for_response {
+            let base = self.last_thinking.unwrap_or_else(Instant::now);
+            return Some(base + THINKING_INTERVAL);
         }
         self.buffering_since.map(|t| t + FLUSH_INTERVAL)
     }
@@ -428,5 +480,29 @@ mod tests {
         s.append_partial("data");
         let deadline = s.next_deadline();
         assert!(deadline.is_some());
+    }
+
+    #[test]
+    fn waiting_for_response_prevents_idle_deadline_from_being_none() {
+        let mut s = StreamState::new(false);
+        assert!(s.next_deadline().is_none());
+        s.waiting_for_response = true;
+        s.last_thinking = Some(Instant::now());
+        assert!(s.next_deadline().is_some());
+    }
+
+    #[test]
+    fn waiting_for_response_batch_mode_returns_deadline() {
+        let mut s = StreamState::new(true);
+        assert!(s.next_deadline().is_none());
+        s.waiting_for_response = true;
+        s.last_thinking = Some(Instant::now());
+        assert!(s.next_deadline().is_some());
+    }
+
+    #[test]
+    fn waiting_for_response_default_false() {
+        let s = StreamState::new(false);
+        assert!(!s.waiting_for_response);
     }
 }

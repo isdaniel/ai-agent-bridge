@@ -1,6 +1,6 @@
 # ai-agent-bridge (`aab`)
 
-> **What this is**: a Rust bridge that lets you operate the AI coding agents you already have logged into your terminal — Claude Code, GitHub Copilot CLI, Zed/Gemini ACP servers — from your phone via LINE or Slack.
+> **What this is**: a Rust bridge that lets you operate the AI coding agents you already have logged into your terminal — Claude Code, GitHub Copilot CLI, Zed/Gemini ACP servers — from your phone via LINE, Slack, Telegram, or Discord.
 >
 > **What this is not**: an API client. The bridge does **not** call Anthropic / OpenAI / GitHub Models APIs as its primary path. Your prompt is forwarded verbatim into the agent CLI you've already authenticated locally; the CLI's reply is forwarded back to chat. No extra API key required for the core flow — the agent CLIs already handle billing / auth.
 
@@ -35,7 +35,12 @@ The bridge passes `--dangerously-skip-permissions` to `claude` by default becaus
 | **`--agent http` / `openai`** — escape hatch for OpenAI-compatible APIs | Off by default; needs API key |
 | **`--platform line`** — LINE Webhook + Reply/Push API | Inbound text + image/file/audio download. Reply API first (free), Push API fallback when token expires. |
 | **`--platform slack`** — Slack Socket Mode | Mention-only in channels (`@bot`), always respond in DMs; thread-aware reply + `files.uploadV2` |
+| **`--platform telegram`** — Telegram Bot API (long-poll) | No webhook/tunnel needed; `getUpdates` long-poll + `sendMessage` / `sendDocument` / `sendPhoto` |
+| **`--platform discord`** — Discord Gateway WebSocket | Mention-only in guilds, always respond in DMs; auto-reconnect + heartbeat |
 | **`--platform stdio`** — local terminal | Dev / smoke test without bot setup |
+| **Multi-platform** | Run multiple platforms simultaneously: `--platform line --platform slack` |
+| **`@agent` prefix routing** | In multi-agent setups, `@claude fix this` routes to the named agent without permanently switching |
+| **Admin API** | `GET /healthz`, `/api/metrics`, `/api/sessions` on configurable port (default `:9095`) |
 | Per-user / per-channel **session persistence** | Restart-safe via `--resume <id>` |
 | **Per-client config isolation** | Each user gets their own `CLAUDE.md`, `.claude/settings.json`, `.mcp.json` (custom memory, skills, MCP per client) |
 | **Slash commands** | `/help /reset /new /agent /agents /yes /no /model /dir` + user templates |
@@ -88,6 +93,9 @@ chmod +x start-bridge.sh
 # Other modes:
 ./start-bridge.sh --platform stdio                  # local terminal smoke test
 ./start-bridge.sh --platform slack                  # Slack Socket Mode (no tunnel)
+./start-bridge.sh --platform telegram               # Telegram long-poll (no tunnel)
+./start-bridge.sh --platform discord                # Discord Gateway (no tunnel)
+./start-bridge.sh --platform "line,slack"           # multi-platform (comma-separated)
 ./start-bridge.sh --agent copilot                   # use gh copilot instead
 ./start-bridge.sh --no-tunnel                       # skip cloudflared (your own ingress)
 ./start-bridge.sh --skip-build --debug              # use existing target/debug/aab
@@ -187,8 +195,11 @@ Loaded from `~/.ai-agent-bridge/config.toml` (override with `--config <path>` or
 ```toml
 [bridge]
 default_agent = "claude"           # claude | copilot | shell | acp | http
-default_platform = "stdio"         # stdio | line | slack
+default_platform = "stdio"         # stdio | line | slack | telegram | discord
 state_dir = "~/.ai-agent-bridge"
+max_sessions = 96                  # hard cap on concurrent live sessions
+idle_timeout_secs = 1800           # close idle sessions after 30 min (default)
+admin_bind = "0.0.0.0:9095"       # admin/observability API bind address
 
 # ----- Agents (CLI-first) -----
 
@@ -259,6 +270,12 @@ public_base_url = "https://media.example.com"
 [platforms.slack]
 app_token_env = "SLACK_APP_TOKEN"            # xapp-... (Socket Mode)
 bot_token_env = "SLACK_BOT_TOKEN"            # xoxb-... (chat / files)
+
+[platforms.telegram]
+bot_token_env = "TELEGRAM_BOT_TOKEN"         # from @BotFather
+
+[platforms.discord]
+bot_token_env = "DISCORD_BOT_TOKEN"          # from Discord Developer Portal
 
 # ----- HTTP escape hatch (only if you really want to skip the CLI) -----
 # Uncomment and supply OPENAI_API_KEY env to use --agent http
@@ -372,11 +389,14 @@ Steps:
 | `agent-http`        | Escape hatch: OpenAI-compatible HTTP/SSE client (off by default) |
 | `platform-line`     | LINE Webhook (HMAC-verified) + Reply API (free) / Push API (fallback) + content download |
 | `platform-slack`    | Slack Socket Mode (WebSocket) + `chat.postMessage` + `files.uploadV2` |
+| `platform-telegram` | Telegram Bot API long-poll (`getUpdates`) + `sendMessage` / `sendDocument` / `sendPhoto` |
+| `platform-discord`  | Discord Gateway WebSocket + REST API (`/channels/{id}/messages`) |
 | `platform-stdio`    | Local terminal frontend (dev / demo) |
+| `admin-api`         | Lightweight axum server: `/healthz`, `/api/metrics`, `/api/sessions` |
 | `media-publisher`   | `MediaPublisher` trait + in-process `LocalHttpPublisher` for hosting outbound files |
 | `daemon`            | Single-instance fd-lock, rotating logs, systemd-user service install |
 | `cli`               | `aab` binary; clap subcommands; reads config; wires platforms ↔ engine ↔ agents |
-| `test-support`      | Shared `EchoAgent` / `MockPlatform` fixtures |
+| `test-support`      | Shared `EchoAgent` / `SlowAgent` / `StreamingAgent` / `MockPlatform` fixtures |
 
 See [`docs/architecture.md`](docs/architecture.md) for design details (actor model, persistence, streaming, permission round-trip).
 

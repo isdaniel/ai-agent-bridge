@@ -12,6 +12,7 @@ mod config;
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
@@ -51,7 +52,7 @@ enum Cmd {
         #[arg(long, value_enum)]
         agent: Option<AgentChoice>,
         #[arg(long, value_enum)]
-        platform: Option<PlatformChoice>,
+        platform: Vec<PlatformChoice>,
     },
     /// Print the persistent session registry.
     Session {
@@ -96,6 +97,8 @@ enum PlatformChoice {
     Stdio,
     Line,
     Slack,
+    Telegram,
+    Discord,
 }
 
 #[tokio::main]
@@ -123,7 +126,7 @@ fn init_tracing() {
 async fn run(
     cfg: AppConfig,
     agent_override: Option<AgentChoice>,
-    platform_override: Option<PlatformChoice>,
+    platform_overrides: Vec<PlatformChoice>,
 ) -> Result<()> {
     let agent_name = match agent_override {
         Some(AgentChoice::Claude) => "claude",
@@ -135,36 +138,69 @@ async fn run(
     }
     .to_string();
 
-    let platform_name = match platform_override {
-        Some(PlatformChoice::Stdio) => "stdio",
-        Some(PlatformChoice::Line) => "line",
-        Some(PlatformChoice::Slack) => "slack",
-        None => &cfg.bridge.default_platform,
-    }
-    .to_string();
+    let platform_names: Vec<String> = if platform_overrides.is_empty() {
+        vec![cfg.bridge.default_platform.clone()]
+    } else {
+        platform_overrides
+            .iter()
+            .map(|p| match p {
+                PlatformChoice::Stdio => "stdio".to_string(),
+                PlatformChoice::Line => "line".to_string(),
+                PlatformChoice::Slack => "slack".to_string(),
+                PlatformChoice::Telegram => "telegram".to_string(),
+                PlatformChoice::Discord => "discord".to_string(),
+            })
+            .collect()
+    };
 
     let agent = build_agent(&agent_name, &cfg)?;
-    let platform = build_platform(&platform_name, &cfg).await?;
 
     let state_path = cfg.bridge.state_dir.join("state.json");
     let registry = Arc::new(Mutex::new(SessionRegistry::open(state_path)?));
 
-    let engine = Engine::builder()
+    let mut builder = Engine::builder()
         .add_agent(agent)
         .default_agent(agent_name.clone())
-        .platform(platform.clone())
         .registry(registry)
         .max_sessions(cfg.bridge.max_sessions)
-        .build()?;
+        .idle_timeout(Duration::from_secs(cfg.bridge.idle_timeout_secs));
 
-    info!(%agent_name, %platform_name, "engine starting");
+    let mut platforms: Vec<Arc<dyn Platform>> = Vec::new();
+    for name in &platform_names {
+        let p = build_platform(name, &cfg).await?;
+        builder = builder.add_platform(p.clone());
+        platforms.push(p);
+    }
+
+    let engine = builder.build()?;
+
+    let joined = platform_names.join(",");
+    info!(%agent_name, platforms=%joined, "engine starting");
     let handler: Arc<dyn core_traits::MessageHandler> = engine.clone();
-    let plat_clone = platform.clone();
+
+    let mut join_set = tokio::task::JoinSet::new();
+    for plat in platforms {
+        let h = handler.clone();
+        join_set.spawn(async move { plat.start(h).await });
+    }
+
+    #[cfg(feature = "admin")]
+    {
+        let admin_engine = engine.clone();
+        let admin_bind = cfg.bridge.admin_bind.clone();
+        join_set.spawn(async move {
+            admin_api::AdminServer::new(admin_bind, admin_engine)
+                .run()
+                .await
+        });
+    }
 
     let shutdown = tokio::signal::ctrl_c();
     tokio::select! {
-        res = plat_clone.start(handler) => {
-            res.context("platform start")?;
+        res = join_set.join_next() => {
+            if let Some(Ok(Err(e))) = res {
+                return Err(e).context("platform exited with error");
+            }
         }
         _ = shutdown => {
             info!("ctrl-c received");
@@ -290,6 +326,7 @@ async fn build_platform(name: &str, cfg: &AppConfig) -> Result<Arc<dyn Platform>
                     .clone()
                     .unwrap_or_else(|| "0.0.0.0:8080".into()),
                 allowlist: p.allowlist.clone().unwrap_or_default(),
+                push_limit: p.push_limit,
             });
             if let Some(media) = &p.media {
                 if let Some(pub_) = build_publisher(media).await? {
@@ -311,6 +348,24 @@ async fn build_platform(name: &str, cfg: &AppConfig) -> Result<Arc<dyn Platform>
                     platform = platform.with_publisher(pub_);
                 }
             }
+            Ok(Arc::new(platform))
+        }
+        #[cfg(feature = "telegram")]
+        "telegram" => {
+            use platform_telegram::{TelegramConfig, TelegramPlatform};
+            let p = cfg.platforms.telegram.clone().unwrap_or_default();
+            let platform = TelegramPlatform::new(TelegramConfig {
+                bot_token: env_or(p.bot_token_env.as_deref(), "TELEGRAM_BOT_TOKEN")?,
+            });
+            Ok(Arc::new(platform))
+        }
+        #[cfg(feature = "discord")]
+        "discord" => {
+            use platform_discord::{DiscordConfig, DiscordPlatform};
+            let p = cfg.platforms.discord.clone().unwrap_or_default();
+            let platform = DiscordPlatform::new(DiscordConfig {
+                bot_token: env_or(p.bot_token_env.as_deref(), "DISCORD_BOT_TOKEN")?,
+            });
             Ok(Arc::new(platform))
         }
         other => Err(anyhow!("platform `{other}` not enabled in this build")),

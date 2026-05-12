@@ -33,8 +33,8 @@ note" for sandboxing recommendations.
 
 ```
                 ┌──────────────────────────────────────────────┐
-inbound msg →   │  Platform trait                              │  LINE / Slack / stdio
-                │   Platform::start(MessageHandler)            │
+inbound msg →   │  Platform trait                              │  LINE / Slack / Telegram /
+                │   Platform::start(MessageHandler)            │  Discord / stdio
                 │   Platform::reply / send_attachment          │
                 └────────────────────┬─────────────────────────┘
                                      │ MessageHandler::handle(Message)
@@ -42,6 +42,7 @@ inbound msg →   │  Platform trait                              │  LINE / S
                 ┌──────────────────────────────────────────────┐
                 │  Engine                                      │  core-engine
                 │   - HashMap<name, Arc<dyn Agent>>            │
+                │   - HashMap<name, Arc<dyn Platform>>         │  ← multi-platform
                 │   - DashMap<SessionKey, SessionHandle>       │
                 │   - SessionRegistry (persisted JSON)         │
                 │   - CommandRegistry (slash builtins)         │
@@ -49,7 +50,10 @@ inbound msg →   │  Platform trait                              │  LINE / S
                 │   dispatch_inner(msg):                       │
                 │     1. drop stale events                     │
                 │     2. parse `/slash` → builtin or template  │
-                │     3. else send_to_session()                │
+                │     3. @agent prefix routing (multi-agent)   │
+                │     4. else send_to_session()                │
+                │   platform_for(key) → resolves platform      │
+                │     from SessionKey prefix                   │
                 └────────────────────┬─────────────────────────┘
                                      │ SessionHandle.tx → Cmd
                                      ▼
@@ -62,7 +66,10 @@ inbound msg →   │  Platform trait                              │  LINE / S
                 │         buffer partial chunks, flush every   │
                 │         1.2 s OR 240 bytes,                  │
                 │         platform.reply / send_attachment     │
-                │       _ = sleep_until(flush_deadline) => flush
+                │       _ = sleep_until(deadline) =>           │
+                │         idle timeout (with waiting_for_      │
+                │         response guard) / batch typing /     │
+                │         partial flush                        │
                 │     }                                        │
                 │   }                                          │
                 └────────────────────┬─────────────────────────┘
@@ -76,6 +83,14 @@ inbound msg →   │  Platform trait                              │  LINE / S
    │ +--dangerously- │ enums + sessions│ AAB_ATTACHMENTS │ NOT the primary    │
    │  skip-perms     │                 │ env to child    │ path               │
    └─────────────────┴─────────────────┴─────────────────┴────────────────────┘
+
+                ┌────────────────────────────────────────────────┐
+                │  Admin API (admin-api)                         │
+                │   GET /healthz                                 │
+                │   GET /api/metrics → Engine::stats()           │
+                │   GET /api/sessions                            │
+                │   Runs on configurable port (default :9095)    │
+                └────────────────────────────────────────────────┘
 ```
 
 ## Crate dependency graph
@@ -92,11 +107,14 @@ inbound msg →   │  Platform trait                              │  LINE / S
                        │
             ┌──────────┼──────────┬─────────────┬──────────────┐
             │          │          │             │              │
-   agent-claude-code  agent-acp  agent-cli  agent-http   platform-{line,slack,stdio}
+   agent-claude-code  agent-acp  agent-cli  agent-http   platform-{line,slack,telegram,
+                                                          discord,stdio}
                                                            │
                                               media-publisher (only platform-line uses it)
                                                            │
-                                                          daemon ── cli (binary `aab`)
+                                                       admin-api ── cli (binary `aab`)
+                                                                       │
+                                                                     daemon
 ```
 
 `core-traits` is deliberately a leaf crate so all backends compile in parallel
@@ -105,9 +123,21 @@ and there's nowhere to accidentally introduce a cycle.
 ## Key invariants
 
 - **`core-traits` is leaf-only.** Agent and platform crates compile in parallel.
+- **Multi-platform Engine.** `Engine` holds `HashMap<String, Arc<dyn Platform>>`.
+  When dispatching a reply, `platform_for(key)` resolves the correct platform
+  from the `SessionKey` prefix (e.g. `"line:U123"` → `platform-line`).
+  All platforms start concurrently in a `JoinSet`.
+- **`@agent` prefix routing.** When multiple agents are registered and a
+  message starts with `@agent_name`, it's routed to that agent's session
+  without permanently switching. The `SessionKey` is suffixed with
+  `@agent_name` to give each user concurrent per-agent sessions.
 - **One actor per live session.** Concurrency is structural; no `Mutex` + busy
   flag is needed inside session state. The actor owns the `AgentSession` and
   serialises both inbound `Cmd`s and outbound `Event`s.
+- **Idle timeout with `waiting_for_response` guard.** Sessions self-close after
+  `idle_timeout` (default 30 min) of inactivity. The `waiting_for_response`
+  flag prevents killing sessions where the agent is processing but hasn't
+  emitted its first token yet (covers slow model cold-starts).
 - **Streaming throttle in the actor.** `Event::AssistantText { partial: true }`
   chunks are accumulated in a `String` buffer and flushed every 1.2 s OR
   240 bytes, whichever fires first. Non-partial frames + `Event::Done` always
@@ -480,6 +510,54 @@ Reads lines from stdin, dispatches each as a `Message` with
 `SessionKey::new("stdio", "local")`, and prints `reply` / `send_attachment`
 output to stdout. For development / CI without bot tokens.
 
+### `platform-telegram` (`crates/platform-telegram/src/lib.rs`)
+
+```text
+inbound:
+  Long-poll loop calling getUpdates?offset=N&timeout=30.
+  No webhook/tunnel needed — works behind NAT.
+  Extracts chat.id + from.id → SessionKey::new("telegram", "{chat_id}/{user_id}")
+
+outbound:
+  text:        POST /bot{token}/sendMessage { chat_id, text, reply_to_message_id? }
+               Text split at 4096 chars via core_traits::split_text.
+  attachment:  POST /bot{token}/sendDocument|sendPhoto|sendAudio (multipart upload)
+  typing:      POST /bot{token}/sendChatAction { chat_id, action: "typing" }
+               Free, 5 s TTL. Called periodically while agent is working.
+```
+
+### `platform-discord` (`crates/platform-discord/src/lib.rs`)
+
+```text
+connect:
+  GET /gateway/bot → { url: "wss://gateway.discord.gg/..." }
+  tokio_tungstenite::connect_async(url?v=10&encoding=json)
+
+gateway events:
+  op 10 (Hello) → extract heartbeat_interval, send Identify (op 2)
+  op 0 (Dispatch):
+    READY → extract bot user_id
+    MESSAGE_CREATE → filter (ignore bots, mention-only in guilds), dispatch
+  op 1 (Heartbeat request) → respond with heartbeat
+  op 7 (Reconnect) → reconnect
+  op 9 (Invalid Session) → re-identify after 3s delay
+  Heartbeat: send op 1 every heartbeat_interval ms
+
+inbound:
+  Guild channels: only respond when <@bot_user_id> is in message content
+  DMs: always respond
+  Strip @mentions from text before forwarding
+  SessionKey::new("discord", "{channel_id}/{user_id}")
+
+outbound:
+  text:        POST /channels/{id}/messages { content }
+               Text split at 2000 chars via core_traits::split_text.
+  attachment:  POST /channels/{id}/messages (multipart form, files[0] part)
+  typing:      POST /channels/{id}/typing (free, 10 s TTL)
+
+reconnect: on disconnect or op 7, reconnect with 5s delay
+```
+
 ## Daemon
 
 `crates/daemon/src/{lib,service}.rs`:
@@ -534,8 +612,9 @@ Run all: `cargo test --workspace`. Run with logs: `AAB_LOG=debug cargo test ...`
 | P5 | SessionRegistry persistence + daemon lock + log rotation + service install/start/stop | ✅ done |
 | P6 | agent-acp (full handshake), agent-http (SSE streaming), Copilot via GitHub Models | ✅ done |
 | P7 | Per-client config isolation: per-SessionKey CWD with own CLAUDE.md, .claude/settings.json, .mcp.json | ✅ done |
+| P8 | Multi-platform engine, admin API, Telegram, Discord, prefix routing, idle timeout, message splitting, LINE rate limiter, LINE replay protection | ✅ done |
 
-## Known follow-ups (not in scope of P1–P6)
+## Known follow-ups (not in scope of P1–P7)
 
 - **R2 / S3 `MediaPublisher`** — trait is in place; only `LocalHttpPublisher`
   ships. Bring your own crate with `aws-sdk-s3` for cloud hosting.
@@ -546,3 +625,7 @@ Run all: `cargo test --workspace`. Run with logs: `AAB_LOG=debug cargo test ...`
   silently.
 - **Granular `/model` switching** — currently `/model` only acks; user must
   `/reset` to apply. A future revision would add `AgentSession::set_model`.
+- **Telegram webhook mode** — alternative to long-poll for high-traffic bots.
+- **Discord voice channel integration** — not yet scoped.
+- **Admin API: write endpoints** — currently read-only; could add session
+  kill, agent restart, config reload.

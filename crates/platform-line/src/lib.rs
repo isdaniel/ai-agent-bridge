@@ -14,9 +14,11 @@
 mod sign;
 mod webhook;
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use core_traits::split_text;
 use core_traits::{Attachment, AttachmentKind, MessageHandler, Platform, ReplyCtx, Result};
 use media_publisher::MediaPublisher;
 use tokio::sync::Mutex;
@@ -34,6 +36,8 @@ pub struct LineConfig {
     pub channel_token: String,
     pub bind: String,
     pub allowlist: Vec<String>,
+    /// Monthly push message limit. None = unlimited (no rate limiting).
+    pub push_limit: Option<u64>,
 }
 
 pub struct LinePlatform {
@@ -42,6 +46,7 @@ pub struct LinePlatform {
     http: reqwest::Client,
     handler: Mutex<Option<Arc<dyn MessageHandler>>>,
     publisher: Option<Arc<dyn MediaPublisher>>,
+    push_count: AtomicU64,
 }
 
 impl LinePlatform {
@@ -52,6 +57,7 @@ impl LinePlatform {
             http: reqwest::Client::new(),
             handler: Mutex::new(None),
             publisher: None,
+            push_count: AtomicU64::new(0),
         }
     }
 
@@ -94,6 +100,19 @@ impl LinePlatform {
     }
 
     async fn push_message(&self, to: &str, messages: &[serde_json::Value]) -> Result<()> {
+        if let Some(limit) = self.cfg.push_limit {
+            let count = self.push_count.load(Ordering::Relaxed);
+            if count >= limit {
+                anyhow::bail!(
+                    "LINE push message quota exhausted ({}/{}). Wait for monthly reset.",
+                    count,
+                    limit
+                );
+            }
+            if count >= limit * 9 / 10 {
+                warn!(count, limit, "LINE push quota near exhaustion (>90%)");
+            }
+        }
         let body = serde_json::json!({"to": to, "messages": messages});
         let resp = self
             .http
@@ -107,6 +126,7 @@ impl LinePlatform {
             let text = resp.text().await.unwrap_or_default();
             anyhow::bail!("LINE push failed: {status} {text}");
         }
+        self.push_count.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
 }
@@ -239,65 +259,6 @@ pub(crate) fn now_ms() -> i64 {
     core_traits::now_ms()
 }
 
-/// Split text into chunks that fit within LINE's character limit.
-/// Splits at natural breakpoints: `---`, markdown headers (`##`), or
-/// double newlines. Falls back to single-newline splits, then hard cuts.
-fn split_text(text: &str, max_len: usize) -> Vec<&str> {
-    if text.len() <= max_len {
-        return vec![text];
-    }
-
-    let mut chunks = Vec::new();
-    let mut remaining = text;
-
-    while !remaining.is_empty() {
-        if remaining.len() <= max_len {
-            chunks.push(remaining.trim());
-            break;
-        }
-
-        let boundary = floor_char_boundary(remaining, max_len);
-        let search_region = &remaining[..boundary];
-
-        // Try splitting at `\n---` (section divider)
-        let split_pos = search_region
-            .rfind("\n---")
-            // Try splitting at markdown header `\n## `
-            .or_else(|| search_region.rfind("\n## "))
-            .or_else(|| search_region.rfind("\n# "))
-            // Try double newline (paragraph break)
-            .or_else(|| search_region.rfind("\n\n"))
-            // Try single newline
-            .or_else(|| search_region.rfind('\n'));
-
-        let pos = match split_pos {
-            Some(p) if p > 0 => p,
-            _ => boundary,
-        };
-
-        let chunk = remaining[..pos].trim();
-        if !chunk.is_empty() {
-            chunks.push(chunk);
-        }
-        remaining = remaining[pos..].trim_start_matches(['-', '\n', '\r']);
-        remaining = remaining.trim_start();
-    }
-
-    chunks.into_iter().filter(|s| !s.is_empty()).collect()
-}
-
-/// Find the largest byte index <= `index` that is a valid char boundary.
-fn floor_char_boundary(s: &str, index: usize) -> usize {
-    if index >= s.len() {
-        return s.len();
-    }
-    let mut i = index;
-    while i > 0 && !s.is_char_boundary(i) {
-        i -= 1;
-    }
-    i
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -343,8 +304,6 @@ mod tests {
 
     #[test]
     fn multibyte_chars_no_panic() {
-        // Each Chinese char is 3 bytes; 2000 chars = 6000 bytes.
-        // Splitting at 5000 bytes must not panic on a char boundary.
         let text = "正".repeat(2000);
         let chunks = split_text(&text, 5000);
         assert!(chunks.len() >= 2);

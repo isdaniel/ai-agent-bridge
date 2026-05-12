@@ -54,6 +54,9 @@ impl SessionKey {
     pub fn platform(&self) -> Option<&str> {
         self.0.split_once(':').map(|(p, _)| p)
     }
+    pub fn with_suffix(&self, suffix: &str) -> Self {
+        Self(format!("{}{suffix}", self.0))
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -232,6 +235,61 @@ pub fn safe_filename(raw: &str) -> String {
     }
 }
 
+/// Split text into chunks that fit within a platform's character limit.
+/// Splits at natural breakpoints: `---`, markdown headers (`##`), or
+/// double newlines. Falls back to single-newline splits, then hard cuts.
+pub fn split_text(text: &str, max_len: usize) -> Vec<&str> {
+    if text.len() <= max_len {
+        return vec![text];
+    }
+
+    let mut chunks = Vec::new();
+    let mut remaining = text;
+
+    while !remaining.is_empty() {
+        if remaining.len() <= max_len {
+            chunks.push(remaining.trim());
+            break;
+        }
+
+        let boundary = floor_char_boundary(remaining, max_len);
+        let search_region = &remaining[..boundary];
+
+        let split_pos = search_region
+            .rfind("\n---")
+            .or_else(|| search_region.rfind("\n## "))
+            .or_else(|| search_region.rfind("\n# "))
+            .or_else(|| search_region.rfind("\n\n"))
+            .or_else(|| search_region.rfind('\n'));
+
+        let pos = match split_pos {
+            Some(p) if p > 0 => p,
+            _ => boundary,
+        };
+
+        let chunk = remaining[..pos].trim();
+        if !chunk.is_empty() {
+            chunks.push(chunk);
+        }
+        remaining = remaining[pos..].trim_start_matches(['-', '\n', '\r']);
+        remaining = remaining.trim_start();
+    }
+
+    chunks.into_iter().filter(|s| !s.is_empty()).collect()
+}
+
+/// Find the largest byte index <= `index` that is a valid char boundary.
+pub fn floor_char_boundary(s: &str, index: usize) -> usize {
+    if index >= s.len() {
+        return s.len();
+    }
+    let mut i = index;
+    while i > 0 && !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -338,5 +396,47 @@ mod tests {
     #[test]
     fn write_temp_file_rejects_empty_name() {
         assert!(write_temp_file("", b"x").is_err());
+    }
+
+    #[test]
+    fn split_text_short_no_split() {
+        let chunks = split_text("hello world", 5000);
+        assert_eq!(chunks, vec!["hello world"]);
+    }
+
+    #[test]
+    fn split_text_at_section_divider() {
+        let text = format!("{}\n---\n{}", "A".repeat(100), "B".repeat(100));
+        let chunks = split_text(&text, 150);
+        assert_eq!(chunks.len(), 2);
+        assert!(chunks[0].starts_with('A'));
+        assert!(chunks[1].starts_with('B'));
+    }
+
+    #[test]
+    fn split_text_at_double_newline() {
+        let text = format!("{}\n\n{}", "A".repeat(100), "B".repeat(100));
+        let chunks = split_text(&text, 150);
+        assert_eq!(chunks.len(), 2);
+    }
+
+    #[test]
+    fn split_text_hard_cut_no_newline() {
+        let text = "A".repeat(300);
+        let chunks = split_text(&text, 100);
+        assert!(chunks.len() >= 3);
+        for chunk in &chunks {
+            assert!(chunk.len() <= 100);
+        }
+    }
+
+    #[test]
+    fn split_text_multibyte_no_panic() {
+        let text = "正".repeat(2000);
+        let chunks = split_text(&text, 5000);
+        assert!(chunks.len() >= 2);
+        for chunk in &chunks {
+            assert!(chunk.len() <= 5000);
+        }
     }
 }

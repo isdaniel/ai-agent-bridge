@@ -7,6 +7,7 @@ pub mod session;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{anyhow, Context};
 use async_trait::async_trait;
@@ -24,7 +25,7 @@ pub use session::{Cmd, SessionActor, SessionHandle};
 pub struct Engine {
     agents: HashMap<String, Arc<dyn Agent>>,
     default_agent: String,
-    platform: Arc<dyn Platform>,
+    platforms: HashMap<String, Arc<dyn Platform>>,
     registry: Arc<Mutex<SessionRegistry>>,
     sessions: dashmap::DashMap<SessionKey, SessionHandle>,
     commands: Arc<RwLock<CommandRegistry>>,
@@ -36,6 +37,9 @@ pub struct Engine {
     /// When true, buffer all partial text and send a single reply per assistant
     /// turn. Avoids fragmented messages on chat platforms (LINE, Slack).
     batch_replies: bool,
+    /// Idle timeout for session actors. Sessions with no activity for this
+    /// duration will self-close and release agent resources.
+    idle_timeout: Duration,
 }
 
 impl Engine {
@@ -45,6 +49,50 @@ impl Engine {
 
     pub fn commands(&self) -> Arc<RwLock<CommandRegistry>> {
         self.commands.clone()
+    }
+
+    /// Returns all registered platforms.
+    pub fn platforms(&self) -> &HashMap<String, Arc<dyn Platform>> {
+        &self.platforms
+    }
+
+    /// Returns engine statistics for the admin API.
+    pub fn stats(&self) -> EngineStats {
+        let sessions: Vec<SessionInfo> = self
+            .sessions
+            .iter()
+            .map(|entry| {
+                let key = entry.key().clone();
+                SessionInfo {
+                    key: key.0.clone(),
+                    platform: key.platform().unwrap_or("unknown").to_string(),
+                }
+            })
+            .collect();
+        EngineStats {
+            active_sessions: sessions.len(),
+            agents: self.agents.keys().cloned().collect(),
+            platforms: self.platforms.keys().cloned().collect(),
+            default_agent: self.default_agent.clone(),
+            uptime_s: ((core_traits::now_ms() - self.boot_time_ms) / 1000) as u64,
+            max_sessions: self.max_sessions,
+            sessions,
+        }
+    }
+
+    /// Look up the platform for a given session key. Falls back to the first
+    /// platform if the key's platform prefix is not found.
+    fn platform_for(&self, key: &SessionKey) -> Arc<dyn Platform> {
+        if let Some(name) = key.platform() {
+            if let Some(p) = self.platforms.get(name) {
+                return p.clone();
+            }
+        }
+        self.platforms
+            .values()
+            .next()
+            .expect("at least one platform must be registered")
+            .clone()
     }
 
     /// Dispatch one inbound chat message: route slash command, claim or spawn
@@ -94,7 +142,7 @@ impl Engine {
                 }
                 None => {
                     let _ = self
-                        .platform
+                        .platform_for(&key)
                         .reply(
                             &reply_ctx,
                             &format!("unknown command `/{name}` — try /help"),
@@ -105,8 +153,40 @@ impl Engine {
             }
         }
 
+        // Prefix routing: if message starts with @agent_name and that agent
+        // is registered, route to a per-agent session for this user.
+        if self.agents.len() > 1 {
+            if let Some((agent, rest)) = self.parse_agent_prefix(&trimmed) {
+                let routed_key = key.with_suffix(&format!("@{agent}"));
+                {
+                    let mut reg = self.registry.lock().await;
+                    reg.set_agent(routed_key.clone(), agent);
+                    reg.persist().await.ok();
+                }
+                return self
+                    .send_to_session(&routed_key, &reply_ctx, rest, attachments)
+                    .await;
+            }
+        }
+
         self.send_to_session(&key, &reply_ctx, trimmed, attachments)
             .await
+    }
+
+    /// Parse `@agent_name rest of message` prefix. Returns (agent_name, remaining_text)
+    /// only if `agent_name` is a registered agent.
+    fn parse_agent_prefix(&self, text: &str) -> Option<(String, String)> {
+        let text = text.strip_prefix('@')?;
+        let (name, rest) = match text.find(|c: char| c.is_whitespace()) {
+            Some(pos) => (&text[..pos], text[pos..].trim_start()),
+            None => (text, ""),
+        };
+        let name_lower = name.to_lowercase();
+        if self.agents.contains_key(&name_lower) && !rest.is_empty() {
+            Some((name_lower, rest.to_string()))
+        } else {
+            None
+        }
     }
 
     async fn send_to_session(
@@ -169,18 +249,20 @@ impl Engine {
                         spec.name, tag, spec.description
                     ));
                 }
-                self.platform.reply(reply_ctx, &lines.join("\n")).await?;
+                self.platform_for(key)
+                    .reply(reply_ctx, &lines.join("\n"))
+                    .await?;
             }
             "new" => {
                 self.reset_session(key).await?;
-                self.platform
+                self.platform_for(key)
                     .reply(reply_ctx, "session reset — next message starts fresh.")
                     .await
                     .ok();
             }
             "clear" => {
                 self.clear_session(key).await?;
-                self.platform
+                self.platform_for(key)
                     .reply(reply_ctx, "session cleared — all history wiped.")
                     .await
                     .ok();
@@ -193,7 +275,7 @@ impl Engine {
                     names.join(", "),
                     self.default_agent
                 );
-                self.platform.reply(reply_ctx, &body).await?;
+                self.platform_for(key).reply(reply_ctx, &body).await?;
             }
             "resume" => {
                 self.handle_resume(args, key, reply_ctx).await?;
@@ -205,7 +287,7 @@ impl Engine {
                 self.handle_skills(key, reply_ctx).await?;
             }
             other => {
-                self.platform
+                self.platform_for(key)
                     .reply(reply_ctx, &format!("/{other} not implemented"))
                     .await?;
             }
@@ -224,7 +306,9 @@ impl Engine {
             // List sessions for this key.
             let reg = self.registry.lock().await;
             let Some(entry) = reg.entries().get(key) else {
-                self.platform.reply(reply_ctx, "no sessions found.").await?;
+                self.platform_for(key)
+                    .reply(reply_ctx, "no sessions found.")
+                    .await?;
                 return Ok(());
             };
             let mut lines = Vec::new();
@@ -240,9 +324,13 @@ impl Engine {
                 lines.push(format!("  … and {} more", past.len() - show));
             }
             if lines.is_empty() {
-                self.platform.reply(reply_ctx, "no sessions found.").await?;
+                self.platform_for(key)
+                    .reply(reply_ctx, "no sessions found.")
+                    .await?;
             } else {
-                self.platform.reply(reply_ctx, &lines.join("\n")).await?;
+                self.platform_for(key)
+                    .reply(reply_ctx, &lines.join("\n"))
+                    .await?;
             }
         } else {
             // Resume a specific session id.
@@ -259,7 +347,7 @@ impl Engine {
                 reg.record_session(key.clone(), agent_name, target_id.to_string());
                 reg.persist().await.ok();
             }
-            self.platform
+            self.platform_for(key)
                 .reply(
                     reply_ctx,
                     &format!("will resume session `{target_id}` on next message."),
@@ -283,14 +371,14 @@ impl Engine {
 
     async fn handle_mcp(&self, key: &SessionKey, reply_ctx: &ReplyCtx) -> Result<()> {
         let Some(dir) = self.agent_client_dir(key) else {
-            self.platform
+            self.platform_for(key)
                 .reply(reply_ctx, "per-client isolation not configured.")
                 .await?;
             return Ok(());
         };
         let mcp_path = dir.join(".mcp.json");
         if !mcp_path.exists() {
-            self.platform
+            self.platform_for(key)
                 .reply(
                     reply_ctx,
                     &format!("no .mcp.json found.\nconfig path: {}", mcp_path.display()),
@@ -310,13 +398,15 @@ impl Engine {
             lines.push("  (none)".to_string());
         }
         lines.push(format!("config: {}", mcp_path.display()));
-        self.platform.reply(reply_ctx, &lines.join("\n")).await?;
+        self.platform_for(key)
+            .reply(reply_ctx, &lines.join("\n"))
+            .await?;
         Ok(())
     }
 
     async fn handle_skills(&self, key: &SessionKey, reply_ctx: &ReplyCtx) -> Result<()> {
         let Some(dir) = self.agent_client_dir(key) else {
-            self.platform
+            self.platform_for(key)
                 .reply(reply_ctx, "per-client isolation not configured.")
                 .await?;
             return Ok(());
@@ -375,7 +465,9 @@ impl Engine {
             }
         }
 
-        self.platform.reply(reply_ctx, &lines.join("\n")).await?;
+        self.platform_for(key)
+            .reply(reply_ctx, &lines.join("\n"))
+            .await?;
         Ok(())
     }
 
@@ -398,7 +490,7 @@ impl Engine {
                 "rejecting new session: max_sessions reached"
             );
             let _ = self
-                .platform
+                .platform_for(key)
                 .reply(
                     reply_ctx,
                     "⚠️ bridge is at capacity (too many active sessions). \
@@ -428,14 +520,15 @@ impl Engine {
             .with_context(|| format!("starting agent `{agent_name}` for {:?}", key))?;
         let id = session.id();
 
-        let actor = SessionActor::spawn(
+        let actor = SessionActor::spawn_with_idle_timeout(
             session,
-            self.platform.clone(),
+            self.platform_for(key),
             reply_ctx.clone(),
             self.registry.clone(),
             key.clone(),
             agent_name.clone(),
             self.batch_replies,
+            self.idle_timeout,
         );
 
         {
@@ -513,6 +606,23 @@ impl Engine {
     }
 }
 
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct EngineStats {
+    pub active_sessions: usize,
+    pub agents: Vec<String>,
+    pub platforms: Vec<String>,
+    pub default_agent: String,
+    pub uptime_s: u64,
+    pub max_sessions: usize,
+    pub sessions: Vec<SessionInfo>,
+}
+
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct SessionInfo {
+    pub key: String,
+    pub platform: String,
+}
+
 #[async_trait]
 impl MessageHandler for Engine {
     async fn handle(&self, message: Message) {
@@ -524,12 +634,13 @@ impl MessageHandler for Engine {
 pub struct EngineBuilder {
     agents: HashMap<String, Arc<dyn Agent>>,
     default_agent: Option<String>,
-    platform: Option<Arc<dyn Platform>>,
+    platforms: HashMap<String, Arc<dyn Platform>>,
     registry: Option<Arc<Mutex<SessionRegistry>>>,
     extra_commands: Vec<CommandSpec>,
     max_sessions: Option<usize>,
     /// Defaults to true via `Self::default()` override below.
     batch_replies: bool,
+    idle_timeout: Option<Duration>,
 }
 
 impl EngineBuilder {
@@ -551,7 +662,11 @@ impl EngineBuilder {
         self
     }
     pub fn platform(mut self, p: Arc<dyn Platform>) -> Self {
-        self.platform = Some(p);
+        self.platforms.insert(p.name().to_string(), p);
+        self
+    }
+    pub fn add_platform(mut self, p: Arc<dyn Platform>) -> Self {
+        self.platforms.insert(p.name().to_string(), p);
         self
     }
     pub fn registry(mut self, r: Arc<Mutex<SessionRegistry>>) -> Self {
@@ -575,6 +690,12 @@ impl EngineBuilder {
         self.batch_replies = b;
         self
     }
+    /// Session idle timeout. Sessions with no activity for this duration
+    /// will self-close. Default 1800s (30 min).
+    pub fn idle_timeout(mut self, d: Duration) -> Self {
+        self.idle_timeout = Some(d);
+        self
+    }
     pub fn build(self) -> Result<Arc<Engine>> {
         let default_agent = self
             .default_agent
@@ -582,7 +703,9 @@ impl EngineBuilder {
         if !self.agents.contains_key(&default_agent) {
             return Err(anyhow!("default_agent `{default_agent}` not registered"));
         }
-        let platform = self.platform.ok_or_else(|| anyhow!("platform required"))?;
+        if self.platforms.is_empty() {
+            return Err(anyhow!("at least one platform required"));
+        }
         let registry = self
             .registry
             .unwrap_or_else(|| Arc::new(Mutex::new(SessionRegistry::in_memory())));
@@ -602,13 +725,14 @@ impl EngineBuilder {
         Ok(Arc::new(Engine {
             agents: self.agents,
             default_agent,
-            platform,
+            platforms: self.platforms,
             registry,
             sessions: dashmap::DashMap::new(),
             commands: Arc::new(RwLock::new(commands)),
             boot_time_ms: now_ms(),
             max_sessions: self.max_sessions.unwrap_or(96),
             batch_replies: self.batch_replies,
+            idle_timeout: self.idle_timeout.unwrap_or(Duration::from_secs(1800)),
         }))
     }
 }
@@ -717,5 +841,47 @@ mod tests {
         // Switch to echo (same agent) should succeed since it's registered.
         let res = engine.switch_agent(&key, "echo").await;
         assert!(res.is_ok());
+    }
+
+    #[tokio::test]
+    async fn prefix_routing_parses_agent() {
+        use core_traits::{Agent, AgentSession};
+
+        struct OtherAgent;
+        #[async_trait]
+        impl Agent for OtherAgent {
+            fn name(&self) -> &'static str {
+                "other"
+            }
+            async fn start_session(
+                &self,
+                key: SessionKey,
+                resume: Option<String>,
+            ) -> Result<Box<dyn AgentSession>> {
+                EchoAgent.start_session(key, resume).await
+            }
+        }
+
+        let platform = Arc::new(MockPlatform::new("t"));
+        let engine = Engine::builder()
+            .add_agent(Arc::new(EchoAgent))
+            .add_agent(Arc::new(OtherAgent))
+            .default_agent("echo")
+            .platform(platform)
+            .build()
+            .unwrap();
+
+        // Matches registered agent
+        let result = engine.parse_agent_prefix("@other explain rebase");
+        assert_eq!(result, Some(("other".into(), "explain rebase".into())));
+
+        // Unknown agent name — returns None
+        assert!(engine.parse_agent_prefix("@unknown hello").is_none());
+
+        // No text after agent name — returns None
+        assert!(engine.parse_agent_prefix("@other").is_none());
+
+        // Not a prefix — returns None
+        assert!(engine.parse_agent_prefix("hello @other").is_none());
     }
 }
