@@ -181,7 +181,8 @@ if __name__ == "__main__":
     parser.add_argument("--phone", required=True, help="Target phone number (E.164)")
     parser.add_argument("--message", required=True, help="Message to speak")
     parser.add_argument("--voice", default="zh-TW-HsiaoChenNeural", help="TTS voice name")
-    parser.add_argument("--timeout", type=int, default=60, help="Timeout in seconds")
+    parser.add_argument("--timeout", type=int, default=60, help="Timeout per attempt in seconds")
+    parser.add_argument("--max-attempts", type=int, default=2, help="Max call attempts")
     args = parser.parse_args()
 
     # Start local callback server
@@ -193,18 +194,31 @@ if __name__ == "__main__":
     tunnel_proc = None
     try:
         callback_base, tunnel_proc = start_tunnel(CALLBACK_PORT)
-        make_call(callback_base, args.phone, args.message, args.voice)
 
-        if call_completed.wait(timeout=args.timeout):
-            if call_result["success"]:
-                print(f"SUCCESS: {call_result['message']}")
-                sys.exit(0)
+        for attempt in range(1, args.max_attempts + 1):
+            # Reset state for each attempt
+            call_completed.clear()
+            call_result["success"] = False
+            call_result["message"] = ""
+
+            print(f"--- Attempt {attempt}/{args.max_attempts} ---")
+            make_call(callback_base, args.phone, args.message, args.voice)
+
+            if call_completed.wait(timeout=args.timeout):
+                if call_result["success"]:
+                    print(f"SUCCESS: {call_result['message']}")
+                    sys.exit(0)
+                else:
+                    print(f"Attempt {attempt} failed: {call_result['message']}")
             else:
-                print(f"FAILED: {call_result['message']}", file=sys.stderr)
-                sys.exit(1)
-        else:
-            print("FAILED: Timeout - recipient did not answer. Do NOT retry automatically.", file=sys.stderr)
-            sys.exit(1)
+                print(f"Attempt {attempt}: no answer (timeout)")
+
+            if attempt < args.max_attempts:
+                print("Retrying in 5 seconds...")
+                time.sleep(5)
+
+        print(f"FAILED: Recipient did not answer after {args.max_attempts} attempts.", file=sys.stderr)
+        sys.exit(1)
     finally:
         if tunnel_proc:
             tunnel_proc.kill()

@@ -8,8 +8,22 @@ Respond in the same language the user writes in.
 - **Documents**: Generate Excel (.xlsx) and Word (.docx) files on demand
 - **Data analysis**: Analyze CSV/Excel data — summaries, pivots, charts
 - **Translation**: Translate text and documents between languages
-- **Web research**: Fetch and summarize web pages using MCP tools
+- **Web research**: Search the web (Brave Search) and fetch web pages using MCP tools
 - **Voice calls**: Make outbound phone calls and play TTS messages to recipients
+- **PDF reading**: Extract and analyze PDF document content
+- **Browser automation**: Automate web interactions via Playwright MCP
+
+## Business skills
+
+- **Product Management**: RICE prioritization, PRD templates, customer interview analysis, product discovery
+- **Project Management**: Enterprise PM with risk analysis, WSJF, portfolio dashboards, RACI matrices
+- **Scrum Master**: Sprint analysis, velocity tracking, retrospective facilitation, team health checks
+- **Meeting Analysis**: Analyze meeting transcripts for communication patterns and coaching feedback
+- **Financial Analysis**: Ratio analysis, DCF valuation, budget variance, rolling forecasts
+- **SaaS Metrics**: ARR/MRR tracking, churn analysis, LTV/CAC, unit economics
+- **Customer Success**: Health scoring, churn risk prediction, expansion opportunities
+- **Contracts & Proposals**: Generate contracts, SOW, NDA, proposals (multi-jurisdiction)
+- **Research Summarization**: Structured summaries of papers, articles, reports with citations
 
 ## File delivery
 
@@ -25,21 +39,10 @@ download link to the user.
 - When generating documents, confirm the structure before creating large files
 - Prefer tables and bullet points over long paragraphs
 
-## Adding web search (Brave Search)
+## MCP servers setup
 
-The template includes the `fetch` MCP server for retrieving individual web pages.
-To add full web search, install Brave Search and add to `.mcp.json`:
+The following MCP servers are configured in `.mcp.json`:
 
-```json
-{
-  "brave-search": {
-    "command": "npx",
-    "args": ["-y", "@anthropic-ai/mcp-server-brave-search"],
-    "env": {
-      "BRAVE_API_KEY": "your-api-key-here"
-    }
-  }
-}
-```
-
-Get a free API key at https://brave.com/search/api/
+- **fetch**: Retrieve and read web pages
+- **playwright**: Browser automation for web interactions
+- **pdf**: PDF document reading and extraction

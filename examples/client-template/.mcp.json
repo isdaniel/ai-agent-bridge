@@ -1,8 +1,15 @@
 {
   "mcpServers": {
     "fetch": {
+      "command": "mcp-server-fetch"
+    },
+    "playwright": {
       "command": "npx",
-      "args": ["-y", "@anthropic-ai/mcp-server-fetch"]
+      "args": ["-y", "@playwright/mcp@latest"]
+    },
+    "pdf": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-pdf"]
     }
   }
 }
