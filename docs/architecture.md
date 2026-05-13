@@ -44,7 +44,7 @@ inbound msg →   │  Platform trait                              │  LINE / S
                 │   - HashMap<name, Arc<dyn Agent>>            │
                 │   - HashMap<name, Arc<dyn Platform>>         │  ← multi-platform
                 │   - DashMap<SessionKey, SessionHandle>       │
-                │   - SessionRegistry (persisted JSON)         │
+                │   - SessionRegistry (persisted SQLite)   │
                 │   - CommandRegistry (slash builtins)         │
                 │                                              │
                 │   dispatch_inner(msg):                       │
@@ -152,11 +152,11 @@ and there's nowhere to accidentally introduce a cycle.
   per user turn. The session actor updates its reply target on each new message,
   so Slack replies always land in the thread where the user asked — not the
   thread where the session was first created.
-- **Persistence stores metadata only.** `state.json` records
-  `SessionKey → {agent, active_session_id, past_agent_session_ids}`. Live
-  agent processes are never serialised — on the next inbound message after a
-  restart the engine spawns a fresh agent and passes `--resume <id>` (Claude
-  Code) or `session/load` (ACP).
+- **Persistence stores metadata only.** `db_data/state.db` (SQLite, WAL mode)
+  records `SessionKey → {agent, active_session_id, past_agent_session_ids}` and
+  scheduled tasks. Live agent processes are never serialised — on the next
+  inbound message after a restart the engine spawns a fresh agent and passes
+  `--resume <id>` (Claude Code) or `session/load` (ACP).
 - **Slash commands** live in `core-commands` and are normalized
   (`-` ≡ `_`, case-insensitive). Built-ins win over user/agent-defined names.
 - **Bidirectional NDJSON** is the shared transport for stream-json (Claude
@@ -228,32 +228,46 @@ think about chunk coalescing.
 
 ## Session persistence
 
-`crates/core-engine/src/registry.rs`. Schema (`schema_version: 1`):
+`crates/core-engine/src/store.rs` — SQLite with WAL mode.
 
-```json
-{
-  "schema_version": 1,
-  "entries": {
-    "line:U123": {
-      "agent": "claude",
-      "active_session_id": "0a2f-...-uuid",
-      "past_agent_session_ids": [["copilot", "older-uuid"]]
-    }
-  }
-}
+`SessionRegistry` (`registry.rs`) is a thin wrapper around `StateDb`. The
+`Scheduler` holds its own connection to the same database file. Both are
+protected by `Arc<Mutex<…>>` at the engine level.
+
+```
+db_data/
+├── state.db          ← sessions table + schedules table
+├── state.db-shm      ← WAL shared memory (auto-managed)
+└── state.db-wal      ← write-ahead log (auto-managed)
 ```
 
-Writes are atomic: `tempfile::NamedTempFile::new_in(parent)` → `.persist(path)`
-on a `spawn_blocking` thread. Schema mismatch on load renames the existing
-file to `.json.bak` and starts fresh, so one bad upgrade doesn't lose the
-ability to boot.
+Schema (SQLite `user_version = 1`):
+
+```sql
+CREATE TABLE sessions (
+    key                    TEXT PRIMARY KEY,
+    agent                  TEXT NOT NULL DEFAULT '',
+    active_session_id      TEXT,
+    past_agent_session_ids TEXT NOT NULL DEFAULT '[]'  -- JSON array of [agent, id] tuples
+);
+
+CREATE TABLE schedules (
+    id              TEXT PRIMARY KEY,
+    session_key     TEXT NOT NULL,
+    prompt          TEXT NOT NULL,
+    reply_ctx       TEXT NOT NULL,   -- JSON-serialized ReplyCtx
+    schedule_kind   TEXT NOT NULL,   -- JSON-serialized ScheduleKind
+    created_at_ms   INTEGER NOT NULL,
+    last_fired_ms   INTEGER
+);
+CREATE INDEX idx_schedules_key ON schedules(session_key);
+```
 
 `/agent <name>` calls `Engine::switch_agent`:
 1. Drop the live actor (`Cmd::Close`).
 2. `registry.clear_active(key)` — pushes the active session id into
    `past_agent_session_ids`.
 3. `registry.set_agent(key, new_name)`.
-4. `persist().await`.
 
 The next inbound message hits `get_or_spawn_session`, which reads the new
 `agent` and (if it had any) the matching `last_session_id` to resume.

@@ -32,6 +32,10 @@ absolute path (e.g. `/tmp/report.xlsx`). Do NOT start an HTTP server to serve
 files — the system automatically detects the file path and provides a secure
 download link to the user.
 
+## Scheduling
+
+For any user request to schedule, remind, or run something on a time/interval, ALWAYS use the `schedule` skill (which emits `<!--aab:schedule ...-->` bridge markers). Never use `CronCreate` / `CronDelete` / `CronList` — those write to Claude Code's internal store and are invisible to the chat bridge, so the user cannot see or manage them via `/schedule-list`. All schedule times are UTC; convert from the user's timezone before emitting the marker.
+
 ## Style
 
 - Keep replies concise — this is a chat interface, not a terminal

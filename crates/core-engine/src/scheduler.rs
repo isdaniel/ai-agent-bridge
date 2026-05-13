@@ -1,6 +1,6 @@
 //! Scheduled actions: fire a stored prompt into an agent session at a
-//! future time (one-shot or recurring). Persisted via [`SessionRegistry`]
-//! so schedules survive process restarts.
+//! future time (one-shot or recurring). Persisted via SQLite through
+//! [`StateDb`] so schedules survive process restarts.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -9,9 +9,9 @@ use anyhow::{anyhow, Result};
 use core_traits::{now_ms, Message, ReplyCtx, SessionKey};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
-use tracing::{debug, info, warn};
+use tracing::{debug, warn};
 
-use crate::registry::SessionRegistry;
+use crate::store::StateDb;
 use crate::Engine;
 
 const TICK_INTERVAL: Duration = Duration::from_secs(30);
@@ -179,7 +179,6 @@ fn parse_hh_mm(s: &str) -> Result<(u32, u32)> {
 fn parse_absolute_utc(s: &str) -> Result<i64> {
     let s = s.trim();
     if s.contains('-') {
-        // Full date-time: YYYY-MM-DD HH:MM
         let parts: Vec<&str> = s.splitn(2, ' ').collect();
         if parts.len() != 2 {
             return Err(anyhow!("expected YYYY-MM-DD HH:MM, got `{s}`"));
@@ -206,7 +205,6 @@ fn parse_absolute_utc(s: &str) -> Result<i64> {
         }
         Ok(epoch_ms)
     } else {
-        // Time only: HH:MM — schedule for today or tomorrow
         let (h, m) = parse_hh_mm(s)?;
         let now = now_ms();
         let today_start = now - (now % 86_400_000);
@@ -232,9 +230,7 @@ fn next_daily_fire(h: u32, m: u32) -> i64 {
 }
 
 /// Convert date components to Unix epoch milliseconds (UTC).
-/// Simple implementation — not accounting for leap seconds.
 fn date_to_epoch_ms(year: i64, month: i64, day: i64, hour: i64, minute: i64) -> i64 {
-    // Days from Unix epoch (1970-01-01) to the start of the given year+month+day.
     let mut y = year;
     let mut m = month;
     if m <= 2 {
@@ -261,7 +257,6 @@ fn format_utc_ms(ms: i64) -> String {
     let h = s_in_day / 3600;
     let m = (s_in_day % 3600) / 60;
 
-    // Reverse the date_to_epoch_ms conversion for display.
     let z = days_since_epoch + 719468;
     let era = if z >= 0 { z } else { z - 146096 } / 146097;
     let doe = z - era * 146097;
@@ -312,19 +307,14 @@ fn format_duration_ms(ms: u64) -> String {
 // ── Scheduler ───────────────────────────────────────────────────────────
 
 pub struct Scheduler {
-    entries: Arc<Mutex<Vec<ScheduleEntry>>>,
-    registry: Arc<Mutex<SessionRegistry>>,
+    db: Arc<Mutex<StateDb>>,
 }
 
 impl Scheduler {
-    pub fn spawn(engine: Arc<Engine>, registry: Arc<Mutex<SessionRegistry>>) -> Arc<Self> {
-        let sched = Arc::new(Self {
-            entries: Arc::new(Mutex::new(Vec::new())),
-            registry,
-        });
+    pub fn spawn(engine: Arc<Engine>, db: Arc<Mutex<StateDb>>) -> Arc<Self> {
+        let sched = Arc::new(Self { db });
 
         let weak = Arc::clone(&sched);
-        let engine = engine;
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(TICK_INTERVAL).await;
@@ -335,44 +325,24 @@ impl Scheduler {
         sched
     }
 
-    pub async fn reload_from_registry(&self) -> Result<()> {
-        let schedules = {
-            let reg = self.registry.lock().await;
-            reg.schedules().to_vec()
-        };
-        let mut entries = self.entries.lock().await;
-        *entries = schedules;
-        info!(count = entries.len(), "loaded schedules from registry");
-        Ok(())
-    }
-
     pub async fn add(&self, entry: ScheduleEntry) -> Result<()> {
-        {
-            let mut entries = self.entries.lock().await;
-            entries.push(entry);
-            self.persist_locked(&entries).await?;
-        }
-        Ok(())
+        let db = self.db.lock().await;
+        db.add_schedule(&entry)
     }
 
     pub async fn remove(&self, key: &SessionKey, id: &str) -> Result<bool> {
-        let mut entries = self.entries.lock().await;
-        let before = entries.len();
-        entries.retain(|e| !(e.key == *key && e.id == id));
-        let removed = entries.len() < before;
-        if removed {
-            self.persist_locked(&entries).await?;
-        }
-        Ok(removed)
+        let db = self.db.lock().await;
+        db.remove_schedule(key, id)
     }
 
     pub async fn list(&self, key: &SessionKey) -> Vec<ScheduleEntry> {
-        let entries = self.entries.lock().await;
-        entries.iter().filter(|e| e.key == *key).cloned().collect()
+        let db = self.db.lock().await;
+        db.list_schedules(key)
     }
 
     pub async fn list_all(&self) -> Vec<ScheduleEntry> {
-        self.entries.lock().await.clone()
+        let db = self.db.lock().await;
+        db.list_all_schedules()
     }
 
     async fn tick(&self, engine: &Arc<Engine>) {
@@ -381,8 +351,9 @@ impl Scheduler {
         let mut completed_ids = Vec::new();
 
         {
-            let mut entries = self.entries.lock().await;
-            for entry in entries.iter_mut() {
+            let db = self.db.lock().await;
+            let entries = db.list_all_schedules();
+            for mut entry in entries {
                 if entry.schedule.should_fire(now) {
                     to_fire.push(entry.clone());
                     entry.last_fired_ms = Some(now);
@@ -390,15 +361,15 @@ impl Scheduler {
                         completed_ids.push(entry.id.clone());
                     } else {
                         entry.schedule.advance();
+                        if let Err(e) = db.update_schedule_fired(&entry.id, now, &entry.schedule) {
+                            warn!(error = %e, id = %entry.id, "failed to update schedule after tick");
+                        }
                     }
                 }
             }
             if !completed_ids.is_empty() {
-                entries.retain(|e| !completed_ids.contains(&e.id));
-            }
-            if !to_fire.is_empty() {
-                if let Err(e) = self.persist_locked(&entries).await {
-                    warn!(error = %e, "failed to persist schedules after tick");
+                if let Err(e) = db.remove_schedules_by_ids(&completed_ids) {
+                    warn!(error = %e, "failed to remove completed schedules");
                 }
             }
         }
@@ -419,12 +390,6 @@ impl Scheduler {
             };
             engine.dispatch(msg).await;
         }
-    }
-
-    async fn persist_locked(&self, entries: &[ScheduleEntry]) -> Result<()> {
-        let mut reg = self.registry.lock().await;
-        reg.set_schedules(entries.to_vec());
-        reg.persist().await
     }
 }
 
@@ -548,7 +513,6 @@ mod tests {
 
     #[test]
     fn parse_at_time_only() {
-        // 23:59 should be either today or tomorrow, but always in the future.
         let kind = parse_schedule("at 23:59").unwrap();
         match kind {
             ScheduleKind::Once { fire_at_ms } => {
@@ -636,16 +600,13 @@ mod tests {
 
     #[test]
     fn format_utc_ms_known_epoch() {
-        // 2025-01-01 00:00 UTC = 1735689600000 ms
         let s = format_utc_ms(1_735_689_600_000);
         assert_eq!(s, "2025-01-01 00:00 UTC");
     }
 
     #[test]
     fn date_to_epoch_ms_round_trips() {
-        // Known: 1970-01-01 00:00 = 0
         assert_eq!(date_to_epoch_ms(1970, 1, 1, 0, 0), 0);
-        // Known: 2000-01-01 00:00 = 946684800000
         assert_eq!(date_to_epoch_ms(2000, 1, 1, 0, 0), 946_684_800_000);
     }
 
@@ -775,8 +736,6 @@ mod tests {
 
     // ── Scheduler CRUD tests ────────────────────────────────────────────
 
-    use crate::registry::SessionRegistry;
-
     fn make_entry(id: &str, key: &SessionKey, prompt: &str) -> ScheduleEntry {
         ScheduleEntry {
             id: id.into(),
@@ -792,13 +751,14 @@ mod tests {
         }
     }
 
+    fn make_test_db() -> Arc<Mutex<StateDb>> {
+        Arc::new(Mutex::new(StateDb::in_memory()))
+    }
+
     #[tokio::test]
     async fn scheduler_add_and_list() {
-        let registry = Arc::new(Mutex::new(SessionRegistry::in_memory()));
-        let sched = Scheduler {
-            entries: Arc::new(Mutex::new(Vec::new())),
-            registry,
-        };
+        let db = make_test_db();
+        let sched = Scheduler { db };
 
         let key = SessionKey::new("t", "u1");
         sched.add(make_entry("s1", &key, "hello")).await.unwrap();
@@ -813,11 +773,8 @@ mod tests {
 
     #[tokio::test]
     async fn scheduler_list_filters_by_key() {
-        let registry = Arc::new(Mutex::new(SessionRegistry::in_memory()));
-        let sched = Scheduler {
-            entries: Arc::new(Mutex::new(Vec::new())),
-            registry,
-        };
+        let db = make_test_db();
+        let sched = Scheduler { db };
 
         let k1 = SessionKey::new("t", "u1");
         let k2 = SessionKey::new("t", "u2");
@@ -831,11 +788,8 @@ mod tests {
 
     #[tokio::test]
     async fn scheduler_remove() {
-        let registry = Arc::new(Mutex::new(SessionRegistry::in_memory()));
-        let sched = Scheduler {
-            entries: Arc::new(Mutex::new(Vec::new())),
-            registry,
-        };
+        let db = make_test_db();
+        let sched = Scheduler { db };
 
         let key = SessionKey::new("t", "u1");
         sched.add(make_entry("s1", &key, "hello")).await.unwrap();
@@ -852,11 +806,8 @@ mod tests {
 
     #[tokio::test]
     async fn scheduler_remove_wrong_key() {
-        let registry = Arc::new(Mutex::new(SessionRegistry::in_memory()));
-        let sched = Scheduler {
-            entries: Arc::new(Mutex::new(Vec::new())),
-            registry,
-        };
+        let db = make_test_db();
+        let sched = Scheduler { db };
 
         let k1 = SessionKey::new("t", "u1");
         let k2 = SessionKey::new("t", "u2");
@@ -865,25 +816,5 @@ mod tests {
         let removed = sched.remove(&k2, "s1").await.unwrap();
         assert!(!removed);
         assert_eq!(sched.list_all().await.len(), 1);
-    }
-
-    #[tokio::test]
-    async fn scheduler_reload_from_registry() {
-        let registry = Arc::new(Mutex::new(SessionRegistry::in_memory()));
-        {
-            let mut reg = registry.lock().await;
-            let key = SessionKey::new("t", "u1");
-            reg.set_schedules(vec![make_entry("s1", &key, "loaded")]);
-        }
-
-        let sched = Scheduler {
-            entries: Arc::new(Mutex::new(Vec::new())),
-            registry,
-        };
-
-        assert!(sched.list_all().await.is_empty());
-        sched.reload_from_registry().await.unwrap();
-        assert_eq!(sched.list_all().await.len(), 1);
-        assert_eq!(sched.list_all().await[0].prompt, "loaded");
     }
 }

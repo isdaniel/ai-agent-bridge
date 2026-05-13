@@ -4,6 +4,7 @@ pub mod framing;
 pub mod registry;
 pub mod scheduler;
 pub mod session;
+pub mod store;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -20,6 +21,7 @@ use tracing::{error, info, warn};
 pub use registry::{RegistryEntry, SessionRegistry};
 pub use scheduler::Scheduler;
 pub use session::{Cmd, SessionActor, SessionHandle};
+pub use store::StateDb;
 
 /// The orchestrator. Holds the agent backends, the active platform, the
 /// session registry, and the slash-command registry. Implements
@@ -177,7 +179,6 @@ impl Engine {
                 {
                     let mut reg = self.registry.lock().await;
                     reg.set_agent(routed_key.clone(), agent);
-                    reg.persist().await.ok();
                 }
                 return self
                     .send_to_session(&routed_key, &reply_ctx, rest, attachments)
@@ -228,7 +229,6 @@ impl Engine {
                 {
                     let mut reg = self.registry.lock().await;
                     reg.clear_active(key);
-                    reg.persist().await.ok();
                 }
                 let handle = self.get_or_spawn_session(key, reply_ctx).await?;
                 handle
@@ -331,7 +331,7 @@ impl Engine {
         if target_id.is_empty() {
             // List sessions for this key.
             let reg = self.registry.lock().await;
-            let Some(entry) = reg.entries().get(key) else {
+            let Some(entry) = reg.get_session(key) else {
                 self.platform_for(key)
                     .reply(reply_ctx, "no sessions found.")
                     .await?;
@@ -371,7 +371,6 @@ impl Engine {
             {
                 let mut reg = self.registry.lock().await;
                 reg.record_session(key.clone(), agent_name, target_id.to_string());
-                reg.persist().await.ok();
             }
             self.platform_for(key)
                 .reply(
@@ -728,7 +727,6 @@ impl Engine {
         {
             let mut reg = self.registry.lock().await;
             reg.record_session(key.clone(), agent_name, id.clone());
-            reg.persist().await.ok();
         }
 
         let handle = SessionHandle {
@@ -746,7 +744,6 @@ impl Engine {
         }
         let mut reg = self.registry.lock().await;
         reg.clear_active(key);
-        reg.persist().await.ok();
         Ok(())
     }
 
@@ -759,7 +756,6 @@ impl Engine {
         }
         let mut reg = self.registry.lock().await;
         reg.clear_all(key);
-        reg.persist().await.ok();
         Ok(())
     }
 
@@ -778,11 +774,10 @@ impl Engine {
         let mut reg = self.registry.lock().await;
         reg.clear_active(key);
         reg.set_agent(key.clone(), new_agent.to_string());
-        reg.persist().await.ok();
         Ok(())
     }
 
-    /// Ordered shutdown: signal every session actor to close, then persist.
+    /// Ordered shutdown: signal every session actor to close.
     pub async fn shutdown(&self) {
         info!("engine shutdown starting");
         let mut handles = Vec::new();
@@ -792,10 +787,6 @@ impl Engine {
         self.sessions.clear();
         for h in handles {
             let _ = h.tx.send(Cmd::Close).await;
-        }
-        let reg = self.registry.lock().await;
-        if let Err(e) = reg.persist().await {
-            warn!(error = %e, "registry persist on shutdown failed");
         }
     }
 }

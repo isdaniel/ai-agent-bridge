@@ -41,7 +41,7 @@ The bridge passes `--dangerously-skip-permissions` to `claude` by default becaus
 | **Multi-platform** | Run multiple platforms simultaneously: `--platform line --platform slack` |
 | **`@agent` prefix routing** | In multi-agent setups, `@claude fix this` routes to the named agent without permanently switching |
 | **Admin API** | `GET /healthz`, `/api/metrics`, `/api/sessions` on configurable port (default `:9095`) |
-| Per-user / per-channel **session persistence** | Restart-safe via `--resume <id>` |
+| Per-user / per-channel **session persistence** | Restart-safe via SQLite (WAL mode); `--resume <id>` |
 | **Per-client config isolation** | Each user gets their own `CLAUDE.md`, `.claude/settings.json`, `.mcp.json` (custom memory, skills, MCP per client) |
 | **Slash commands** | `/help /reset /new /agent /agents /yes /no /model /dir` + user templates |
 | **Live agent switch** via `/agent <name>` | Closes current session, archives id, next message spawns new agent |
@@ -381,7 +381,7 @@ Steps:
 | Crate | Purpose |
 |---|---|
 | `core-traits`       | `Agent`, `AgentSession`, `Platform`, `MessageHandler` traits + DTOs (leaf, no deps on the rest) |
-| `core-engine`       | Session manager actor, registry persistence, partial-chunk flushing, NDJSON framing helpers, slash dispatcher |
+| `core-engine`       | Session manager actor, registry persistence (SQLite), scheduler, partial-chunk flushing, NDJSON framing helpers, slash dispatcher |
 | `core-commands`     | Slash command parser, normalized name registry, template expansion |
 | `agent-claude-code` | Long-lived `claude --input-format stream-json` driver, `--dangerously-skip-permissions` by default |
 | `agent-acp`         | JSON-RPC over stdio + ACP `initialize` / `session/*` handshake |

@@ -480,17 +480,14 @@ async fn handle_event(
         Event::Error(msg) => {
             state.flush(platform, reply_ctx).await;
             let _ = platform.reply(reply_ctx, &format!("⚠️ {msg}")).await;
-            // Clear active session so the next spawn doesn't --resume a broken ID.
             let mut reg = registry.lock().await;
             reg.clear_active(key);
-            let _ = reg.persist().await;
         }
         Event::Done { session_id } => {
             state.flush(platform, reply_ctx).await;
             let mut reg = registry.lock().await;
-            if let Some(entry) = reg.entries().get(key).cloned() {
+            if let Some(entry) = reg.get_session(key) {
                 reg.record_session(key.clone(), entry.agent, session_id);
-                let _ = reg.persist().await;
             }
         }
     }
@@ -656,17 +653,16 @@ mod tests {
     // ── process_aab_commands tests ────────────────────────────────────────
 
     fn make_test_scheduler() -> Arc<Scheduler> {
-        use crate::Engine;
+        use crate::{Engine, StateDb};
         let platform = Arc::new(test_support::MockPlatform::new("t"));
-        let registry = Arc::new(Mutex::new(SessionRegistry::in_memory()));
+        let db = Arc::new(Mutex::new(StateDb::in_memory()));
         let engine = Engine::builder()
             .add_agent(Arc::new(test_support::EchoAgent))
             .default_agent("echo")
             .platform(platform)
-            .registry(registry.clone())
             .build()
             .unwrap();
-        Scheduler::spawn(engine, registry)
+        Scheduler::spawn(engine, db)
     }
 
     #[tokio::test]

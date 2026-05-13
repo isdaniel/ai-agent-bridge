@@ -45,9 +45,14 @@ crates/
 │   │                    processing (free, no message quota).
 │   │                    reply_ctx updates per-message so thread-aware
 │   │                    replies track the latest conversation thread.
-│   ├── registry.rs      SessionRegistry — atomic JSON persistence at
-│   │                    state.json (schema_version=1). Maps SessionKey
-│   │                    to {agent, active_session_id, past_history}.
+│   ├── registry.rs      SessionRegistry — thin wrapper around StateDb.
+│   │                    Maps SessionKey → {agent, active_session_id,
+│   │                    past_history}.
+│   ├── store.rs         StateDb — SQLite (WAL mode) persistence for
+│   │                    sessions + scheduled tasks.
+│   ├── scheduler.rs     Scheduled actions — one-shot and recurring
+│   │                    prompts persisted in SQLite, fired by a
+│   │                    30 s tick loop.
 │   └── framing.rs       NDJSON helpers: spawn_ndjson_reader,
 │                        write_ndjson, DEFAULT_MAX_LINE = 8 MiB
 │                        (used by agent-claude-code AND agent-acp).
@@ -183,8 +188,8 @@ crates/
 | `SessionActor` (`core-engine/session.rs`) | Buffers `partial:true` text chunks; flushes every 1.2 s OR 240 bytes; force-flushes on `partial:false` / `Done` / `PermissionRequest` / `AssistantAttachment` / `Error`. **Batch mode** (default `batch_replies=true`): never flushes partials — waits for non-partial/Done and sends a single message per turn. Fires `Platform::show_typing()` every 15 s while processing. | LINE / Slack rate-limit + UX. Without throttle, streaming agents flood the chat. Batch mode prevents fragmented replies. Typing indicator uses free platform APIs (LINE Loading Animation / Slack typing) to avoid consuming message quota. |
 | `SessionActor` reply_ctx | `Cmd::Send` carries a fresh `ReplyCtx` per message; the actor updates its reply target on each user turn. | Slack thread-aware replies: bot replies in the thread where the user asked, not the thread where the session was first created. |
 | `SlackPlatform` mention filter | In channels (C/G prefix), only responds when `<@BOT_USER_ID>` appears in the message text; strips the mention tag before forwarding. DMs (D prefix) always respond. Bot user ID resolved once via `auth.test` on startup. | Prevents the bot from responding to every message in busy channels. |
-| `SessionRegistry` | Stores **metadata only**. Live agent processes are NEVER serialised. | Process state isn't portable. Next inbound message after restart spawns fresh agent with `--resume <id>` (Claude) or `session/load` (ACP). |
-| `state.json` | Has `schema_version: 1`. Mismatched version → rename to `.json.bak`, start fresh. | Forward upgrade safety. Bump the const + add migration if you change the shape. |
+| `SessionRegistry` | Stores **metadata only** in SQLite (WAL mode). Live agent processes are NEVER serialised. | Process state isn't portable. Next inbound message after restart spawns fresh agent with `--resume <id>` (Claude) or `session/load` (ACP). |
+| `state.db` | SQLite database in `db_data/` subdirectory (under `client_config_base_dir` or `state_dir`). | O(1) per-row writes vs O(N) full-file serialize; WAL mode for concurrent reads. |
 | `agent-claude-code::session::spawn` | Mints `--session-id <uuid>` for fresh sessions, `--resume <id>` for resumes. | We must know the session id immediately (for the registry) without waiting for the first system event. |
 | `Attachment` for Claude inbound | Always base64-encoded inline in the NDJSON stream. | The `"type":"file"` source format is not supported by the Anthropic API; base64 is the universal format. |
 | `LinePlatform::reply` | Reply API first (`/v2/bot/message/reply`, free — no quota), Push API fallback (`/v2/bot/message/push`, counted) if reply token expired (>25 s) or already consumed. | Reply tokens are valid ~30 s from webhook receipt. In batch mode most responses finish within the window and cost zero quota. |
@@ -310,8 +315,10 @@ CI runs all three on every PR (Linux only). Don't merge red.
 
 - **Secrets**: in `.env` (gitignored) or env vars. `config.toml` only
   names which env var to read — never values.
-- **Persistent state**: `~/.ai-agent-bridge/{state.json, daemon.lock,
-  logs/aab.log.YYYY-MM-DD}`.
+- **Persistent state**: `<state_dir>/db_data/state.db` (SQLite + WAL files).
+  When `client_config_base_dir` is set, the database lives under that path
+  instead.
+  Also: `<state_dir>/daemon.lock`, `<state_dir>/logs/aab.log.YYYY-MM-DD`.
 - **Service unit**: `~/.config/systemd/user/aab.service` (managed by
   `aab daemon install/uninstall`).
 - **Cloudflare tunnel**: external process. `start-bridge.sh` spawns it;
@@ -344,7 +351,6 @@ CI runs all three on every PR (Linux only). Don't merge red.
 | Slack replies in wrong thread | Check that `Cmd::Send` carries fresh `reply_ctx` — see `session.rs` |
 | LINE 429 monthly limit | Push message quota exhausted; `show_typing()` uses free Loading Animation API and should not contribute. Wait for monthly reset or upgrade plan. |
 | `another instance holds the daemon lock` | leftover `aab` process or stale lock; `pkill aab` then retry |
-| `state.json` schema bumped | check version constant in `core-engine/src/registry.rs::SCHEMA_VERSION` |
 
 ## 12. Style
 

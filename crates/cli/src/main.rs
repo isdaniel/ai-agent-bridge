@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
-use core_engine::{Engine, SessionRegistry};
+use core_engine::{Engine, SessionRegistry, StateDb};
 use core_traits::{Agent, Platform};
 use tokio::sync::Mutex;
 use tracing::info;
@@ -34,14 +34,22 @@ fn expand_tilde(p: PathBuf) -> PathBuf {
     p
 }
 
-fn resolve_state_path(cfg: &AppConfig) -> PathBuf {
-    let agent_name = &cfg.bridge.default_agent;
-    if let Some(agent) = cfg.agents.get(agent_name) {
-        if let Some(ref base_dir) = agent.client_config_base_dir {
-            return expand_tilde(base_dir.clone()).join("state.json");
+fn resolve_state_db_path(cfg: &AppConfig) -> PathBuf {
+    let base = {
+        let agent_name = &cfg.bridge.default_agent;
+        if let Some(agent) = cfg.agents.get(agent_name) {
+            if let Some(ref base_dir) = agent.client_config_base_dir {
+                expand_tilde(base_dir.clone())
+            } else {
+                cfg.bridge.state_dir.clone()
+            }
+        } else {
+            cfg.bridge.state_dir.clone()
         }
-    }
-    cfg.bridge.state_dir.join("state.json")
+    };
+    let dir = base.join("db_data");
+    std::fs::create_dir_all(&dir).ok();
+    dir.join("state.db")
 }
 
 #[derive(Parser, Debug)]
@@ -165,8 +173,8 @@ async fn run(
 
     let agent = build_agent(&agent_name, &cfg)?;
 
-    let state_path = resolve_state_path(&cfg);
-    let registry = Arc::new(Mutex::new(SessionRegistry::open(state_path)?));
+    let db_path = resolve_state_db_path(&cfg);
+    let registry = Arc::new(Mutex::new(SessionRegistry::open(db_path.clone())?));
 
     let mut builder = Engine::builder()
         .add_agent(agent)
@@ -184,9 +192,9 @@ async fn run(
 
     let engine = builder.build()?;
 
-    // Spawn the scheduler and attach it to the engine.
-    let sched = core_engine::Scheduler::spawn(engine.clone(), engine.registry().clone());
-    sched.reload_from_registry().await?;
+    // Spawn the scheduler with its own SQLite connection to the same db.
+    let sched_db = Arc::new(Mutex::new(StateDb::open(db_path)?));
+    let sched = core_engine::Scheduler::spawn(engine.clone(), sched_db);
     engine.set_scheduler(sched);
 
     let joined = platform_names.join(",");
@@ -433,7 +441,7 @@ async fn build_publisher(
 }
 
 async fn session_action(cfg: AppConfig, action: SessionAction) -> Result<()> {
-    let path = resolve_state_path(&cfg);
+    let path = resolve_state_db_path(&cfg);
     let mut reg = SessionRegistry::open(path)?;
     match action {
         SessionAction::List => {

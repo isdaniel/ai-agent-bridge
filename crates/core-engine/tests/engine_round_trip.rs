@@ -3,7 +3,7 @@
 
 use std::sync::Arc;
 
-use core_engine::{Engine, Scheduler, SessionRegistry};
+use core_engine::{Engine, Scheduler, StateDb};
 use core_traits::{Message, MessageHandler, ReplyCtx, SessionKey};
 use test_support::{EchoAgent, MockPlatform};
 use tokio::sync::Mutex;
@@ -210,15 +210,14 @@ async fn max_sessions_rejects_overflow() {
 // ── Schedule integration tests ──────────────────────────────────────────
 
 fn make_engine_with_scheduler(platform: Arc<MockPlatform>) -> (Arc<Engine>, Arc<Scheduler>) {
-    let registry = Arc::new(Mutex::new(SessionRegistry::in_memory()));
     let engine = Engine::builder()
         .add_agent(Arc::new(EchoAgent))
         .default_agent("echo")
         .platform(platform)
-        .registry(registry.clone())
         .build()
         .unwrap();
-    let sched = Scheduler::spawn(engine.clone(), registry);
+    let db = Arc::new(Mutex::new(StateDb::in_memory()));
+    let sched = Scheduler::spawn(engine.clone(), db);
     engine.set_scheduler(sched.clone());
     (engine, sched)
 }

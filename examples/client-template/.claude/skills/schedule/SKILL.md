@@ -7,6 +7,8 @@ description: Schedule timed or recurring actions using natural language. Use whe
 
 排程管理：建立、查看、刪除定時或週期性動作。
 
+**IMPORTANT:** This skill is the ONLY correct way to schedule actions in this project. Do NOT use `CronCreate` / `CronDelete` / `CronList` — those write to Claude Code's internal store and the chat bridge cannot see them, so the user will not find them in `/schedule-list` and cannot manage them.
+
 ## How it works
 
 Include a hidden marker in your response. The bridge intercepts it and creates/queries/deletes schedule entries internally. The user never sees the marker — only your natural language confirmation.
